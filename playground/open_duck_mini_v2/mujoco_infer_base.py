@@ -252,9 +252,11 @@ class MJInferBase:
     #     return data.site_xmat[self.imu_site_id].reshape((3, 3)).T @ np.array([0, 0, -1])
 
     def get_gravity(self, data):
-        return data.sensordata[
-            self.gravity_id : self.gravity_id + self.gravity_dimensions
-        ]
+        # sensor id 를 sensordata 주소로 쓰면 안 된다. gyro/accelerometer 처럼
+        # sensor_adr 로 변환해야 한다. 원래는 upvector 대신 local_linvel 을 읽고
+        # 있어서 서 있든 넘어졌든 늘 0 근처가 나왔다.
+        adr = self.model.sensor_adr[self.gravity_id]
+        return data.sensordata[adr : adr + self.gravity_dimensions]
 
     def check_contact(self, data, body1_name, body2_name):
         body1_id = data.body(body1_name).id
