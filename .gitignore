@@ -9,3 +9,4 @@ checkpoints/
 .tmp/
 *.onnx
 *.TXT
+*.orig
