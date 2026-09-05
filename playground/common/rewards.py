@@ -132,6 +132,7 @@ def cost_head_pos(
     joints_qpos: jax.Array,
     joints_qvel: jax.Array,
     cmd: jax.Array,
+    only_when_moving: bool = True,
 ) -> jax.Array:
     move_cmd_norm = jp.linalg.norm(cmd[:3])
     head_cmd = cmd[3:]
@@ -144,7 +145,10 @@ def cost_head_pos(
 
     # head_vel_error = jp.sum(jp.square(head_vel - target_head_qvel))
 
-    return jp.nan_to_num(head_pos_error) * (move_cmd_norm > 0.01)
+    # only_when_moving=False 로 두면 제자리에서도 머리 명령을 추종한다.
+    # 제자리 춤/두리번거림에는 이쪽이 필요하다.
+    gate = (move_cmd_norm > 0.01) if only_when_moving else 1.0
+    return jp.nan_to_num(head_pos_error) * gate
     # return jp.nan_to_num(head_pos_error + head_vel_error)
 
 

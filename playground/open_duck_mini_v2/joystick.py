@@ -12,6 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified 2026 (Open Duck Mini v2 term project):
+#   - register the previously-unused `cost_head_pos` reward so head commands
+#     are actually tracked (head_pos=-1.0, tracking ignore_head=True)
+#   - retune command ranges to match the reference motion's real coverage
+#     (lin_vel_x/lin_vel_y), removing the tracking-vs-imitation conflict
 # ==============================================================================
 """Joystick task for Open Duck Mini V2. (based on Berkeley Humanoid)"""
 
@@ -38,6 +44,7 @@ from playground.common.rewards import (
     cost_action_rate,
     cost_stand_still,
     reward_alive,
+    cost_head_pos,
 )
 from playground.open_duck_mini_v2.custom_rewards import reward_imitation
 
@@ -83,6 +90,10 @@ def default_config() -> config_dict.ConfigDict:
                 stand_still=-0.2,  # was -1.0 TODO try to relax this a bit ?
                 alive=20.0,
                 imitation=1.0,
+                # 머리 4축(neck_pitch, head_pitch, head_yaw, head_roll)이 명령을 따라가게 한다.
+                # 원본에는 cost_head_pos 가 정의만 되어 있고 등록되지 않아, 정책이 머리 명령을
+                # 완전히 무시하고 home 자세로 굳어 있었다.
+                head_pos=-1.0,
             ),
             tracking_sigma=0.01,  # was working at 0.01
         ),
@@ -91,9 +102,16 @@ def default_config() -> config_dict.ConfigDict:
             interval_range=[5.0, 10.0],
             magnitude_range=[0.1, 1.0],
         ),
-        lin_vel_x=[-0.15, 0.15],
-        lin_vel_y=[-0.2, 0.2],
-        ang_vel_yaw=[-1.0, 1.0],  # [-1.0, 1.0]
+        # 레퍼런스 모션(polynomial_coefficients.pkl)이 실제로 갖고 있는 범위에 맞춘다.
+        #   dx     [-0.148, 0.222]   dy [-0.111, 0.111]   dtheta [-1.111, 1.222]
+        # 원본 설정은 전진을 0.15 로 묶어 레퍼런스의 0.222 를 48% 놀리고 있었고,
+        # 반대로 게걸음은 0.2 까지 명령하는데 레퍼런스는 0.111 뿐이라
+        # vel_to_index 가 clip 해버린다 → 0.111~0.2 구간 전체가 같은 레퍼런스로 간다.
+        # 그 구간에서 tracking_lin_vel("0.2로 가") 과 imitation("0.111 걸음처럼 생겨라")
+        # 이 정면충돌한다. 범위를 맞춰서 둘을 같은 편으로 만든다.
+        lin_vel_x=[-0.148, 0.222],
+        lin_vel_y=[-0.111, 0.111],
+        ang_vel_yaw=[-1.0, 1.0],  # 레퍼런스는 ±1.111~1.222 라 여유 있음
         neck_pitch_range=[-0.34, 1.1],
         head_pitch_range=[-0.78, 0.78],
         head_yaw_range=[-1.5, 1.5],
@@ -656,13 +674,19 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 info["command"],
                 USE_IMITATION_REWARD,
             ),
+            "head_pos": cost_head_pos(
+                self.get_actuator_joints_qpos(data.qpos),
+                self.get_actuator_joints_qvel(data.qvel),
+                info["command"],
+                only_when_moving=False,
+            ),
             "stand_still": cost_stand_still(
                 # info["command"], data.qpos[7:], data.qvel[6:], self._default_pose
                 info["command"],
                 self.get_actuator_joints_qpos(data.qpos),
                 self.get_actuator_joints_qvel(data.qvel),
                 self._default_actuator,
-                ignore_head=False,
+                ignore_head=True,  # 머리는 head_pos 가 담당한다
             ),
         }
 
