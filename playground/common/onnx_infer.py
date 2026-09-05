@@ -4,8 +4,18 @@ import onnxruntime
 class OnnxInfer:
     def __init__(self, onnx_model_path, input_name="obs", awd=False):
         self.onnx_model_path = onnx_model_path
+        # The policy is a ~900 KB MLP that infers in 0.03 ms, but the default
+        # session grabs one thread per core and those threads spin-wait between
+        # calls. At 50 Hz that leaves a whole CPU busy doing nothing - on a
+        # 16-core laptop it pegged every core and made the machine unusable.
+        # One thread, no spinning: same latency, idle CPU between steps.
+        opts = onnxruntime.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
         self.ort_session = onnxruntime.InferenceSession(
-            self.onnx_model_path, providers=["CPUExecutionProvider"]
+            self.onnx_model_path, opts, providers=["CPUExecutionProvider"]
         )
         self.input_name = input_name
         self.awd = awd
