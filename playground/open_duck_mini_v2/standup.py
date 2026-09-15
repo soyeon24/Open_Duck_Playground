@@ -47,9 +47,9 @@ from typing import Any, Dict, Optional, Union
 
 import jax
 import jax.numpy as jp
+import numpy as np
 from ml_collections import config_dict
 from mujoco import mjx
-from mujoco.mjx._src import math
 
 from mujoco_playground._src import mjx_env
 from mujoco_playground._src.collision import geoms_colliding
@@ -67,25 +67,24 @@ from playground.common.rewards import (
 
 STANDUP_XML = constants.ROOT_PATH / "xmls" / "scene_standup.xml"
 
-# Height the base is dropped from at reset, and the height that counts as
-# "fully stood up". The home keyframe puts the base at 0.15 m.
-DROP_HEIGHT = 0.22
+# Settled fallen poses, generated offline by `make_standup_poses.py`. See
+# `reset` for why the episode starts from a table instead of a live drop.
+POSE_BANK = constants.ROOT_PATH / "data" / "standup_poses.npy"
+
+# The height that counts as "fully stood up"; the home keyframe puts the base
+# at 0.15 m.
 TARGET_HEIGHT = 0.15
 
-# Range of tilt applied at reset, in radians: 20 to 180 degrees.
-#
-# Spawning only past horizontal (the obvious reading of "get up from a fall")
-# turns out to be the wrong call. Random exploration never completes a full
-# recovery from flat on the back, so the policy never sees a success and there
-# is no gradient to follow - trained that way it just lies still.
-#
-# Sampling the whole range instead gives a curriculum for free. A 20 degree tilt
-# is recovered by a small correction, which exploration does find, and that
-# reward pulls the policy toward the harder starts. It also matches what the
-# robot actually meets in use: stumbles, shoves and walking into things are far
-# more common than ending up flat on its back.
-MIN_FALL_ANGLE = 0.35
-MAX_FALL_ANGLE = 3.14159
+# Collision boxes that must leave the floor for the robot to be off the ground.
+# Knees and shins are deliberately excluded: kneeling is a legitimate - in fact
+# necessary - stage of getting up, so penalising knee contact would punish the
+# one intermediate posture the task is trying to reach.
+BODY_GEOMS = ("trunk_assembly_ground_collision", "head_assembly_ground_collision")
+
+# Height at which the body counts as fully clear of the floor, in metres.
+# Standing puts the bottom of the trunk box about 0.12 m up, so this saturates
+# well before the robot is upright and keeps paying during the kneel.
+CLEAR_HEIGHT = 0.05
 
 
 def default_config() -> config_dict.ConfigDict:
@@ -102,6 +101,18 @@ def default_config() -> config_dict.ConfigDict:
         # and getting the feet underneath you. Without it the policy thrashes
         # without ever organising the motion.
         feet_contact=1.5,
+        # Push the body off the floor.
+        #
+        # Measured on the v2/v3/v4 policies with `eval_standup.py`: from any
+        # start past 45 degrees they reach a lying pose and stop there, scoring
+        # upright 0.5 and everything else 0. The reason is that every other term
+        # is gated on `uprightness`, which is 0 while the torso is horizontal -
+        # so the whole first half of getting up (tuck the legs, plant the feet,
+        # press the trunk off the ground) pays exactly nothing, and the policy
+        # settles for lying still. This term is the one thing that does pay
+        # during that phase, and unlike raw height it cannot be farmed by lying
+        # inverted on the head plate.
+        ground_clear=2.0,
         # Anti-thrash, gated on being upright. Nothing else in this set damps
         # torso rotation, so the policy learned to flail; it reaches upright and
         # then shakes itself over. Ungated this would fight the roll-over, which
@@ -159,6 +170,23 @@ class Standup(Joystick):
         )
         self._post_init()
 
+        self._body_geom_id = np.array(
+            [self._mj_model.geom(name).id for name in BODY_GEOMS]
+        )
+        self._body_geom_half = jp.asarray(self._mj_model.geom_size[self._body_geom_id])
+        if not POSE_BANK.exists():
+            raise FileNotFoundError(
+                f"{POSE_BANK} is missing. Generate it first:\n"
+                "    python make_standup_poses.py"
+            )
+        fallen = np.load(POSE_BANK.as_posix())
+        if fallen.shape[1] != self.mjx_model.nq:
+            raise ValueError(
+                f"{POSE_BANK} holds qpos of width {fallen.shape[1]}, but this model "
+                f"has nq={self.mjx_model.nq}. Regenerate the bank against the same XML."
+            )
+        self._fallen_qpos = jp.asarray(fallen)
+
     # -- no velocity commands in this task -------------------------------------
 
     def sample_command(self, rng: jax.Array) -> jax.Array:
@@ -173,29 +201,51 @@ class Standup(Joystick):
     # -- start the episode on the ground ---------------------------------------
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
+        """Start the episode genuinely lying on the floor.
+
+        The previous version built the start pose live: tilt the home keyframe by
+        a random angle about a random horizontal axis, set the base to 0.22 m,
+        begin. Three things were wrong with it, all found by actually settling
+        those poses and looking at them (`standup_feasibility.py` prints the
+        survey):
+
+        1.  The episode began in mid-air. The robot spent the first third of a
+            second falling, so "start from lying down" was never what was being
+            trained.
+        2.  The tilt angle barely mattered. Every start between 90 and 160
+            degrees settles into the *same* pose (up 0.00, base 14.7 cm, trunk
+            box on the floor). The wide angle range was meant to be a curriculum;
+            in practice it dealt the same hand over and over.
+        3.  At exactly 180 degrees the robot lands on its head plate - 20x20 cm,
+            flat - and stays there, balanced upside down with its feet 35 cm in
+            the air. That is not a fallen robot, it is a headstand, and it only
+            exists because a perfectly inverted body is dropped at zero velocity
+            onto a flat plate. The hardest end of the curriculum was an artefact.
+
+        So the falls are now simulated offline instead, with random tilt, random
+        joint offsets and a random shove, and only poses that have come to rest
+        are kept. `reset` draws from that table. Sampling a real distribution of
+        resting poses is also what makes the start states diverse in the way the
+        angle sweep was supposed to be.
+        """
         # Let Joystick build a complete, valid state (info dict, metrics keys,
         # reference motion, push schedule), then re-init the physics from a
         # fallen pose.
         state = super().reset(rng)
         info = dict(state.info)
-        rng, k_axis, k_angle = jax.random.split(info["rng"], 3)
+        rng, k_pose, k_joint = jax.random.split(info["rng"], 3)
 
-        addr = self._floating_base_qpos_addr
-        qpos = state.data.qpos
-
-        # Tilt by a random angle about a random *horizontal* axis. The axis has
-        # to lie in the xy plane: a rotation about anything close to vertical
-        # only yaws the robot and leaves it standing, so the sampled angle would
-        # stop meaning anything. With a horizontal axis the torso tilts by
-        # exactly `angle`, which is what makes the curriculum above work, and the
-        # uniform direction spreads the landings over back, front and both sides.
-        phi = jax.random.uniform(k_axis, (), minval=0.0, maxval=2.0 * jp.pi)
-        axis = jp.array([jp.cos(phi), jp.sin(phi), 0.0])
-        angle = jax.random.uniform(k_angle, (), minval=MIN_FALL_ANGLE, maxval=MAX_FALL_ANGLE)
-        qpos = qpos.at[addr + 3 : addr + 7].set(
-            math.quat_mul(qpos[addr + 3 : addr + 7], math.axis_angle_to_quat(axis, angle))
+        qpos = self._fallen_qpos[
+            jax.random.randint(k_pose, (), 0, self._fallen_qpos.shape[0])
+        ]
+        # A little joint jitter on top, so the policy cannot memorise the 512
+        # table entries. Kept small: these poses are resting in contact, and a
+        # large perturbation would start the episode with the feet driven
+        # through the floor.
+        joints = self.get_actuator_joints_qpos(qpos)
+        qpos = self.set_actuator_joints_qpos(
+            joints + jax.random.normal(k_joint, joints.shape) * 0.02, qpos
         )
-        qpos = qpos.at[addr + 2].set(DROP_HEIGHT)
 
         qvel = jp.zeros(self.mjx_model.nv)
         ctrl = self.get_actuator_joints_qpos(qpos)
@@ -249,15 +299,41 @@ class Standup(Joystick):
         # for stillness only once the robot is nearly there.
         settled = jp.clip((up - 0.5) * 2.0, 0.0, 1.0)
 
+        # How far the body is off the floor, as a 0..1 weight. This is the one
+        # signal that is available while the robot is still horizontal, and it is
+        # what turns "lie still" from a local optimum into a losing move.
+        #
+        # Measured as the lowest corner of the trunk and head boxes rather than
+        # as a contact test. A contact test was the first attempt and it is
+        # wrong twice over: `geoms_colliding` only fires on actual penetration,
+        # so 38% of the settled lying poses in the bank read as "clear" and
+        # collected the bonus for lying down (measured - `smoke_standup.py`
+        # step 7 catches it); and being binary it pays nothing for lifting the
+        # body 4 cm, which is exactly the increment the policy has to discover.
+        # Geometry has neither problem: it is margin-free and it is continuous.
+        pos = data.geom_xpos[self._body_geom_id]
+        mat = data.geom_xmat[self._body_geom_id].reshape(-1, 3, 3)
+        # World-z half-extent of an oriented box: |R_z . h| summed per axis.
+        drop = jp.sum(jp.abs(mat[:, 2, :]) * self._body_geom_half, axis=-1)
+        ground_clear = jp.clip(jp.min(pos[:, 2] - drop) / CLEAR_HEIGHT, 0.0, 1.0)
+
         return {
             "upright": (up + 1.0) * 0.5,
             # Scaled by uprightness, otherwise balancing on the head would score
             # as well as standing on the feet.
             "height": jp.clip(height / TARGET_HEIGHT, 0.0, 1.0) * uprightness,
-            # Feet down counts for more the more upright the torso is, so the
-            # policy is pulled toward "feet under me, torso up" rather than
-            # toward lying on its back with its soles against the floor.
-            "feet_contact": jp.sum(contact) / 2.0 * uprightness,
+            # Gated on the body being off the floor rather than on uprightness.
+            #
+            # Gating on uprightness was meant to stop the robot scoring for
+            # lying on its back with its soles against the floor, and it does -
+            # but it also zeroes the term throughout the half of the motion
+            # where planting the feet is the whole job. `ground_clear` rules out
+            # the same cheat (on your back, the trunk box is down, so the gate is
+            # 0) while paying for the posture that actually leads somewhere:
+            # feet on the floor, body off it. That is a kneel, and a kneel is
+            # one push away from standing.
+            "feet_contact": jp.sum(contact) / 2.0 * ground_clear,
+            "ground_clear": ground_clear,
             "ang_vel_xy": cost_ang_vel_xy(self.get_global_angvel(data)) * settled,
             "alive": reward_alive(),
             "torques": cost_torques(data.actuator_force),
