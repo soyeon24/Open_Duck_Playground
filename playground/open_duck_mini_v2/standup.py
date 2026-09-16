@@ -43,6 +43,7 @@ so a policy trained here loads in `mujoco_infer.py` exactly like a walking one:
         --model_path playground/open_duck_mini_v2/xmls/scene_standup.xml
 """
 
+import os
 from typing import Any, Dict, Optional, Union
 
 import jax
@@ -70,6 +71,35 @@ STANDUP_XML = constants.ROOT_PATH / "xmls" / "scene_standup.xml"
 # Settled fallen poses, generated offline by `make_standup_poses.py`. See
 # `reset` for why the episode starts from a table instead of a live drop.
 POSE_BANK = constants.ROOT_PATH / "data" / "standup_poses.npy"
+
+# States sampled along a get-up trajectory that works, found by direct
+# trajectory optimisation (`standup_feasibility.py`) and expanded into states by
+# `make_standup_refstates.py`. Each row is [qpos | qvel].
+REF_STATES = constants.ROOT_PATH / "data" / "standup_refstates.npy"
+
+# Fraction of episodes that start part-way through that trajectory instead of
+# flat on the floor.
+#
+# Reward shaping alone does not get this task off the ground - v5 trained for
+# 300M steps on the fixed rewards and still scored 0/120. Replaying the known
+# solution shows why, and it is not something a reward can fix: the trajectory
+# passes through up = -0.70 on its way to up = +0.84. Getting up requires first
+# becoming *more* inverted, and `upright` at weight 5.0 punishes exactly that.
+# Any reward monotone in uprightness makes the solution a valley the policy has
+# to cross, and Gaussian action noise does not cross four seconds of coordinated
+# motion by luck.
+#
+# Starting some episodes near the end of the trajectory sidesteps the search
+# entirely: the policy learns to finish from almost-standing, and the value
+# function carries that backwards into the hard part. Half and half, because
+# training only on reference states teaches the tail and never the task - the
+# start distribution the policy is actually scored on is the pose bank.
+#
+# Overridable from the environment so one visit to the cluster can launch a
+# sweep; the runner has no seed or hyper-parameter arguments and `runner.py` is
+# diverged on the server, so an env var is the only knob that does not mean
+# shipping a shared file.
+REF_FRACTION = float(os.environ.get("REF_FRACTION", "0.5"))
 
 # The height that counts as "fully stood up"; the home keyframe puts the base
 # at 0.15 m.
@@ -187,6 +217,21 @@ class Standup(Joystick):
             )
         self._fallen_qpos = jp.asarray(fallen)
 
+        if not REF_STATES.exists():
+            raise FileNotFoundError(
+                f"{REF_STATES} is missing. Generate it first:\n"
+                "    python make_standup_refstates.py"
+            )
+        ref = np.load(REF_STATES.as_posix())
+        want = self.mjx_model.nq + self.mjx_model.nv
+        if ref.shape[1] != want:
+            raise ValueError(
+                f"{REF_STATES} holds rows of width {ref.shape[1]}, but this model wants "
+                f"nq+nv={want}. Regenerate it against the same XML."
+            )
+        self._ref_qpos = jp.asarray(ref[:, : self.mjx_model.nq])
+        self._ref_qvel = jp.asarray(ref[:, self.mjx_model.nq :])
+
     # -- no velocity commands in this task -------------------------------------
 
     def sample_command(self, rng: jax.Array) -> jax.Array:
@@ -233,21 +278,31 @@ class Standup(Joystick):
         # fallen pose.
         state = super().reset(rng)
         info = dict(state.info)
-        rng, k_pose, k_joint = jax.random.split(info["rng"], 3)
+        rng, k_pose, k_joint, k_ref, k_mode = jax.random.split(info["rng"], 5)
 
-        qpos = self._fallen_qpos[
+        fallen = self._fallen_qpos[
             jax.random.randint(k_pose, (), 0, self._fallen_qpos.shape[0])
         ]
-        # A little joint jitter on top, so the policy cannot memorise the 512
-        # table entries. Kept small: these poses are resting in contact, and a
-        # large perturbation would start the episode with the feet driven
-        # through the floor.
+        # The other half of the draw: a state part-way along a get-up that
+        # works. See REF_FRACTION for why this is here rather than a reward.
+        i_ref = jax.random.randint(k_ref, (), 0, self._ref_qpos.shape[0])
+        use_ref = jax.random.uniform(k_mode, ()) < REF_FRACTION
+
+        qpos = jp.where(use_ref, self._ref_qpos[i_ref], fallen)
+        # Reference states carry momentum, and dropping it would start the
+        # episode in a pose that the trajectory never actually passes through -
+        # mid-roll with zero angular velocity is a different problem. Poses from
+        # the bank have already come to rest, so zero is right for those.
+        qvel = jp.where(use_ref, self._ref_qvel[i_ref], jp.zeros(self.mjx_model.nv))
+
+        # A little joint jitter on top, so the policy cannot memorise the table
+        # entries. Kept small: the bank poses are resting in contact, and a large
+        # perturbation would start the episode with the feet driven through the
+        # floor.
         joints = self.get_actuator_joints_qpos(qpos)
         qpos = self.set_actuator_joints_qpos(
             joints + jax.random.normal(k_joint, joints.shape) * 0.02, qpos
         )
-
-        qvel = jp.zeros(self.mjx_model.nv)
         ctrl = self.get_actuator_joints_qpos(qpos)
         data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=ctrl)
 
