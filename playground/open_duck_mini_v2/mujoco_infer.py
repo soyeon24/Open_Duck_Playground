@@ -177,6 +177,19 @@ class MjInfer(MJInferBase):
         #
         # ⚠ 벽이 표적 정면을 막는 배치는 **어떤 조합도 아직 통과하지 못한다.**
         self.HEAD_AIM_BLEND = 0.5
+        # 몸통을 표적 쪽으로 향한 채 두고, 우회는 게걸음으로만 할지.
+        # 앞서 게걸음을 켰을 때도 ang 을 go_b(갈 방향)에 물려서 몸이 같이 돌았고,
+        # 그게 사람을 화각 밖으로 밀어내는 원인이었다. 몸을 표적에 고정하면
+        # 사람이 시야에서 빠질 일이 없다. 대신 우회 속도가 게걸음 한계(0.111)에
+        # 묶여 전진(0.222)의 절반이다.
+        self.face_target = True
+
+        # 표적을 놓쳤을 때 쓸 월드 기준 방위 기억. 몸통 요를 적분해 들고 있으면
+        # 안 보이는 동안에도 사람이 어느 쪽인지 안다. 막 훑는 것보다 훨씬 낫다.
+        # 실기에서는 자이로 z 적분이라 드리프트가 쌓이지만, 표적을 다시 잡을
+        # 때까지 몇 초만 버티면 되는 용도라 충분하다.
+        self.target_world_deg = None
+
         # 게걸음으로 비켜 갈지. 켜면 벽 배치에서 81% 로 나빠진다 (위 표).
         # 회피 방향과 머리 조준이 서로 물려 돌아 표적을 놓치기 때문으로 보인다.
         self.use_sidestep = False
@@ -292,6 +305,7 @@ class MjInfer(MJInferBase):
             self.follow = not self.follow
             self.follow_lost = 0
             self.avoid_side = 0
+            self.target_world_deg = None
             if not self.follow:
                 self.commands[0:3] = [0.0, 0.0, 0.0]
                 self.commands[5] = 0.0
@@ -380,14 +394,27 @@ class MjInfer(MJInferBase):
         img = self.follow_rend.render()
         res = band_tracker.track(img, float(self.model.cam_fovy[self.follow_cam_id]))
 
+        # 월드 기준 몸통 방위. 실기에서는 자이로 z 적분으로 얻는다.
+        q = self.get_floating_base_qpos(self.data.qpos)[3:7]
+        body_yaw = np.degrees(np.arctan2(2 * (q[0] * q[3] + q[1] * q[2]),
+                                         1 - 2 * (q[2] ** 2 + q[3] ** 2)))
+
         if res is None:
-            # 놓쳤다. 전진을 멈추고 마지막으로 본 쪽으로 천천히 훑는다.
+            # 놓쳤다. 월드 기준으로 어디 있었는지 기억하고 있으면 그쪽으로 돈다.
+            # 기억이 없을 때만 마지막으로 본 쪽으로 훑는다.
             # 놓치기 직전의 부호를 쓰는 게 핵심이다 — 고정 방향으로 훑으면
             # 표적이 오른쪽으로 사라졌는데 왼쪽으로 도는 일이 생긴다.
             self.follow_lost += 1
             self.commands[0] = 0.0
             self.commands[1] = 0.0
-            self.commands[2] = self.FOLLOW_SEARCH * self.follow_last_sign
+            if self.target_world_deg is not None:
+                # 기억한 월드 방위를 지금 몸통 기준으로 되돌린다.
+                err = (self.target_world_deg - body_yaw + 180.0) % 360.0 - 180.0
+                self.commands[2] = float(np.clip(
+                    self.FOLLOW_KP * err,
+                    self.COMMANDS_RANGE_THETA[0], self.COMMANDS_RANGE_THETA[1]))
+            else:
+                self.commands[2] = self.FOLLOW_SEARCH * self.follow_last_sign
             return
         self.follow_lost = 0
         self.follow_last_sign = 1.0 if res["bearing_deg"] >= 0 else -1.0
@@ -400,6 +427,7 @@ class MjInfer(MJInferBase):
         # 실기에서는 head_yaw 를 서보 엔코더에서 읽는다.
         head_yaw = np.degrees(self.data.qpos[self.model.joint("head_yaw").qposadr[0]])
         target_b = res["bearing_deg"] + head_yaw
+        self.target_world_deg = body_yaw + target_b   # 안 보일 때 쓸 기억
         go_b, blocked = target_b, False
 
         if self.avoid:
@@ -466,10 +494,14 @@ class MjInfer(MJInferBase):
         # 쪼개서 주면, 몸이 다 돌기를 기다리지 않고 곧바로 옆으로 비켜 간다.
         # 몸은 몸대로 go_b 쪽으로 돌고, 다 돌고 나면 go_b 가 0 이 되어 자연히
         # 순수 전진이 된다. 제자리 선회라는 상태 자체가 사라진다.
-        ang = float(np.clip(self.FOLLOW_KP * go_b,
+        # face_target 이면 몸통은 표적을 향한 채로 두고 우회는 게걸음이 맡는다.
+        turn_to = target_b if self.face_target else go_b
+        ang = float(np.clip(self.FOLLOW_KP * turn_to,
                             self.COMMANDS_RANGE_THETA[0], self.COMMANDS_RANGE_THETA[1]))
 
-        rad = np.radians(np.clip(go_b, -90.0, 90.0)) if self.use_sidestep else 0.0
+        # 몸통을 표적에 고정했으면 go_b 는 그대로 몸통 기준 진행방향이다.
+        sidestep = self.use_sidestep or self.face_target
+        rad = np.radians(np.clip(go_b, -90.0, 90.0)) if sidestep else 0.0
         cx, sy = np.cos(rad), np.sin(rad)
         # 전진과 게걸음의 허용치가 다르므로(0.222 대 0.111), 둘 다 범위에 들어가는
         # 가장 빠른 속도를 고른다. 한쪽만 포화시키면 실제 진행 방향이 틀어진다.
@@ -481,7 +513,7 @@ class MjInfer(MJInferBase):
 
         if blocked or res["distance_m"] < self.FOLLOW_STOP_M:
             vx = vy = 0.0                 # 막혔거나 다 왔으면 선다
-        elif not self.use_sidestep:
+        elif not sidestep:
             # 옛 방식: 많이 틀어져 있으면 전진 없이 제자리 선회
             vy = 0.0
             vx = (0.0 if abs(go_b) > self.FOLLOW_ALIGN_DEG else
