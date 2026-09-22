@@ -1,0 +1,123 @@
+<mujoco model="Open Duck Mini V2 - obstacles + person (playback only)">
+    <!-- ══════════════════════════════════════════════════════════════════════
+         재생 / 지각 실험 전용 씬. **학습에는 절대 쓰지 말 것.**
+         (scene_flat_terrain_backlash_collision.xml 과 같은 이유: 충돌체가 늘면
+          동역학과 속도가 바뀐다. 학습은 scene_flat_terrain_backlash.xml.)
+
+         바닥·마찰·home 키프레임은 학습 씬과 동일하게 맞춰 두었다. 다른 점은 셋뿐:
+           1. 카메라 달린 모델(open_duck_mini_v2_backlash_collision_cam.xml)
+           2. 오리와 사람 사이를 막는 장애물 3개
+           3. mocap 으로 움직일 수 있는 사람 (발목에 형광 밴드)
+         ══════════════════════════════════════════════════════════════════════ -->
+    <include file="open_duck_mini_v2_backlash_collision_cam.xml"/>
+
+    <visual>
+        <headlight diffuse="0.6 0.6 0.6" ambient="0.35 0.35 0.35" specular="0 0 0"/>
+        <rgba haze="0.15 0.25 0.35 1"/>
+        <global azimuth="160" elevation="-20" offwidth="1280" offheight="960"/>
+        <!-- offwidth/offheight: 오프스크린 렌더 기본값이 640x480 이라
+             그보다 큰 mujoco.Renderer 를 만들면 ValueError 가 난다. -->
+        <quality shadowsize="4096"/>
+    </visual>
+
+    <asset>
+        <texture type="skybox" builtin="gradient" rgb1="0.75 0.82 0.9" rgb2="0.95 0.97 1" width="800" height="800"/>
+        <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="1 1 1" rgb2="1 1 1" markrgb="0 0 0"
+            width="300" height="300"/>
+        <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0"/>
+        <!-- 장애물은 바닥(흰색)과 확실히 구분되는 색으로. floor-plane 방식 시험용. -->
+        <material name="obstacle_mat" rgba="0.35 0.38 0.45 1"/>
+        <!-- 발목 형광 밴드: 색추종의 표적. 주변에 같은 색이 없어야 한다. -->
+        <material name="band_mat" rgba="0.15 1.0 0.1 1" emission="0.35"/>
+        <material name="person_mat" rgba="0.55 0.45 0.4 1"/>
+    </asset>
+
+    <worldbody>
+        <light name="sun" pos="1 -1 3" dir="-0.3 0.3 -1" directional="true" diffuse="0.5 0.5 0.5"/>
+
+        <body name="floor">
+            <geom name="floor" size="0 0 0.01" type="plane" material="groundplane" contype="1" conaffinity="0"
+                priority="1" friction="0.6" condim="3"/>
+        </body>
+
+        <!-- ── 장애물 ────────────────────────────────────────────────────────
+             오리 골반이 0.15 m 라는 걸 기준으로 읽을 것.
+               a: 18cm 벽   — 정면. 넘을 수 없다, 반드시 돌아가야 한다.
+               b: 24cm 기둥 — 우회 경로 위. 한쪽으로만 돌면 또 막힌다.
+               c: 6cm 턱    — 낮다. 넘을 수 있는지 없는지가 애매한 높이. -->
+        <body name="obstacles">
+            <geom name="obs_a_wall" type="box" pos="0.75 0.05 0.09" size="0.05 0.12 0.09"
+                material="obstacle_mat" contype="1" conaffinity="1"/>
+            <geom name="obs_b_pillar" type="cylinder" pos="1.15 -0.35 0.12" size="0.06 0.12"
+                material="obstacle_mat" contype="1" conaffinity="1"/>
+            <geom name="obs_c_curb" type="box" pos="1.00 0.45 0.03" size="0.14 0.06 0.03"
+                material="obstacle_mat" contype="1" conaffinity="1"/>
+        </body>
+
+        <!-- ── 사람 (mocap) ──────────────────────────────────────────────────
+             mocap 이라 물리에 안 끌려다니고 Python 에서 data.mocap_pos 로 옮길 수 있다.
+             추종 실험에서 사람을 걸어다니게 만들 자리가 여기다.
+             발목 밴드는 바닥에서 0.06~0.12 m — 오리 카메라(0.375 m)에서 내려다보인다. -->
+        <body name="person" mocap="true" pos="1.90 0.15 0">
+            <geom name="person_leg_l" type="capsule" fromto="0 0.09 0.13  0 0.09 0.88" size="0.048"
+                material="person_mat" contype="0" conaffinity="0"/>
+            <geom name="person_leg_r" type="capsule" fromto="0 -0.09 0.13  0 -0.09 0.88" size="0.048"
+                material="person_mat" contype="0" conaffinity="0"/>
+            <geom name="person_band_l" type="cylinder" pos="0 0.09 0.09" size="0.055 0.030"
+                material="band_mat" contype="0" conaffinity="0"/>
+            <geom name="person_band_r" type="cylinder" pos="0 -0.09 0.09" size="0.055 0.030"
+                material="band_mat" contype="0" conaffinity="0"/>
+            <geom name="person_foot_l" type="box" pos="0.04 0.09 0.025" size="0.11 0.045 0.025"
+                material="person_mat" contype="0" conaffinity="0"/>
+            <geom name="person_foot_r" type="box" pos="0.04 -0.09 0.025" size="0.11 0.045 0.025"
+                material="person_mat" contype="0" conaffinity="0"/>
+            <geom name="person_torso" type="box" pos="0 0 1.18" size="0.10 0.17 0.30"
+                material="person_mat" contype="0" conaffinity="0"/>
+            <geom name="person_head" type="sphere" pos="0 0 1.58" size="0.10"
+                material="person_mat" contype="0" conaffinity="0"/>
+        </body>
+    </worldbody>
+
+    <keyframe>
+        <key name="home"
+            qpos="
+        0 0 0.15
+        1 0 0 0
+
+        0.002 0
+        0.053 0
+        -0.63 0
+        1.368 0
+        -0.784 0
+
+        0
+        0
+        0
+        0
+
+        -0.003 0
+        -0.065 0
+        0.635 0
+        1.379 0
+        -0.796 0
+"
+            ctrl="
+          0.002
+        0.053
+        -0.63
+        1.368
+        -0.784
+        0
+        0
+        0
+        0
+        -0.003
+        -0.065
+        0.635
+        1.379
+        -0.796
+          "
+            mpos="1.90 0.15 0"
+            mquat="1 0 0 0"/>
+    </keyframe>
+</mujoco>
