@@ -15,6 +15,19 @@ from playground.open_duck_mini_v2.mujoco_infer_base import MJInferBase
 
 USE_MOTOR_SPEED_LIMITS = True
 
+
+def _band_tracker():
+    """band_tracker.py 를 불러온다.
+
+    이 fork 안이 아니라 상위 프로젝트 루트에 있다 — 실기로 옮길 때 mujoco
+    의존성 없이 그 파일 하나만 들고 가려고 일부러 밖에 뒀다.
+    """
+    _root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    import band_tracker
+    return band_tracker
+
 # ── 안무 (t 초 -> neck_pitch, head_pitch, head_yaw, head_roll) ────────────────
 # 학습된 정책은 머리 명령을 무시한다 (joystick.py 에 머리 추종 보상이 등록돼 있지
 # 않아서, head_yaw 를 ±1.5 로 줘도 실제 관절은 -0.23 에서 안 움직인다). 그래서
@@ -135,7 +148,16 @@ class MjInfer(MJInferBase):
         self.FOLLOW_KP = 0.020
         self.FOLLOW_STOP_M = 0.55       # 이보다 가까우면 전진을 멈춘다
         self.FOLLOW_ALIGN_DEG = 40.0    # 이만큼 틀어져 있으면 전진 없이 제자리 선회
-        self.FOLLOW_SEARCH = 0.35       # 표적을 놓쳤을 때 훑는 요 명령
+        # 표적을 놓쳤을 때 제자리에서 훑는 요 명령. 0.35 였는데 **그 값은 아무
+        # 일도 안 한다.** scene_person.xml 에서 12초 제자리 회전을 재보면
+        # (명령 -> 회전속도)
+        #        0.35    0.40    0.50    0.55    0.70    0.80    1.00
+        #   08-31  4°/s    5      8      11      19      24      33
+        #   head   0°/s    1      4       9      23      29      39
+        # 0.5 아래는 사실상 제자리다. 걸어가면서 주는 작은 요 명령(FOLLOW_KP)은
+        # 이 사각지대와 별개다 — 전진 중에는 작은 값도 먹는다. 제자리 선회만
+        # 문턱이 높다. 0.8 이면 두 정책 다 25~29°/s 로, 한 바퀴에 13초다.
+        self.FOLLOW_SEARCH = 0.8
 
         # 장애물 회피 (V 키). 바닥 채도로 빈 곳을 찾아 표적 쪽에 가장 가까운
         # 빈 방향으로 간다. 이것도 정책 밖 층이라 재학습이 없다.
@@ -193,6 +215,29 @@ class MjInfer(MJInferBase):
         # 게걸음으로 비켜 갈지. 켜면 벽 배치에서 81% 로 나빠진다 (위 표).
         # 회피 방향과 머리 조준이 서로 물려 돌아 표적을 놓치기 때문으로 보인다.
         self.use_sidestep = False
+
+        # ── 지정한 지점까지 혼자 가기 (N 키) ──────────────────────────────
+        # 출발점과 도착점이 정해져 있을 때, 방향키 없이 도착점까지 간다.
+        # 순서는 셋이다:
+        #   scan    제자리에서 돌며 사람을 찾는다. 출발 방향을 모른 채 걸어
+        #           나가면 엉뚱한 데로 갔다가 되돌아와야 한다. 서서 도는 건
+        #           싸고, 도는 동안 넘어질 일도 없다.
+        #   go      찾았으면 그 뒤로는 추종과 **같은 코드**(follow_step)다.
+        #   arrived FOLLOW_STOP_M 까지 붙으면 명령을 0 으로 두고 선다.
+        #
+        # 도착점 좌표(self.goal)는 어느 쪽으로 돌지 정하는 데만 쓴다. 좌표를
+        # 따라 걷지 않는다 — 걸어가는 동안 좌표를 믿으려면 위치추정이 필요한데,
+        # 사람을 눈으로 보고 가면 그게 필요 없다. 좌표는 "왼쪽으로 돌까
+        # 오른쪽으로 돌까" 한 번 고르는 데만 있으면 된다.
+        self.goto = False
+        self.goto_phase = "scan"
+        self.goal = None          # (x, y) 월드. None 이면 아무 쪽으로나 훑는다.
+        self.scan_sign = 1.0
+        self.scan_steps = 0
+        self.follow_dist = float("nan")   # 마지막으로 본 표적 거리 (도착 판정용)
+        # 한 프레임만 보고 출발하면 반사광 같은 걸 사람으로 오인한 채 나간다.
+        self.GOTO_LOCK_N = 3      # 연속 이만큼 잡히면 진짜로 본 것으로 친다
+        self.goto_seen = 0
 
         print(f"joint names: {self.joint_names}")
         print(f"actuator names: {self.actuator_names}")
@@ -265,6 +310,10 @@ class MjInfer(MJInferBase):
         self.dance = None
         self.dance_t = 0.0
         self.prev_head = np.array(self.default_actuator[5:9], dtype=float).copy()
+        self.goto = False
+        self.goto_phase = "scan"
+        self.goto_seen = 0
+        self.follow_dist = float("nan")
         print(">>> RESET : home keyframe + policy state cleared")
 
     def key_callback(self, keycode):
@@ -301,6 +350,15 @@ class MjInfer(MJInferBase):
             print(f">>> 장애물 회피 {'ON' if self.avoid else 'OFF'}"
                   f"{'  (추종을 켜야 동작한다)' if self.avoid and not self.follow else ''}")
             return
+        if keycode == 78:  # n : 자율 이동 on/off (돌며 찾고 -> 가고 -> 선다)
+            if self.goto:
+                self.goto = False
+                self.commands[0:3] = [0.0, 0.0, 0.0]
+                self.commands[5] = 0.0
+                print(">>> 자율 이동 OFF")
+            else:
+                self.start_goto()
+            return
         if keycode == 70:  # f : 사람 자동 추종 on/off
             self.follow = not self.follow
             self.follow_lost = 0
@@ -314,9 +372,10 @@ class MjInfer(MJInferBase):
             return
         # 방향키 등 수동 입력이 들어오면 추종을 끈다. 사람이 몰기 시작했는데
         # 정책이 계속 자기 명령을 덮어쓰면 조종이 안 되는 것처럼 보인다.
-        if self.follow:
+        if self.follow or self.goto:
             self.follow = False
-            print(">>> 수동 입력 — 자동 추종 OFF")
+            self.goto = False
+            print(">>> 수동 입력 : 자동 추종/자율 이동 OFF")
         lin_vel_x = 0
         lin_vel_y = 0
         ang_vel = 0
@@ -364,40 +423,168 @@ class MjInfer(MJInferBase):
         self.commands[1] = lin_vel_y
         self.commands[2] = ang_vel
 
-    def follow_step(self):
-        """머리 카메라로 사람을 찾아 속도 명령을 만든다. 정책은 그대로 둔다.
+    def render_head(self):
+        """머리 카메라를 한 장 찍어 돌려준다. 씬에 카메라가 없으면 None.
 
-        지각은 정책 밖의 층이라 재학습이 필요 없다. 정책은 자기가 받는 3개 숫자가
-        사람이 누른 방향키에서 왔는지 카메라에서 왔는지 구분하지 못한다.
+        **한 장만 찍는 게 요점이다.** 색추종과 바닥스캔이 같은 프레임을 봐야
+        한다 — 따로 찍으면 두 판단이 서로 다른 순간의 장면을 근거로 삼는다.
+        렌더러는 처음 쓸 때 만든다. 추종을 안 쓰는 사람에게 오프스크린 GL
+        컨텍스트 비용을 지울 이유가 없다.
         """
-        # band_tracker.py 는 이 fork 가 아니라 상위 프로젝트 루트에 있다 (실기로
-        # 옮길 때 mujoco 의존성 없이 그 파일만 들고 가려고 밖에 뒀다).
-        _root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-        if _root not in sys.path:
-            sys.path.insert(0, _root)
-        import band_tracker
-
         if self.follow_rend is None:
             try:
                 self.follow_cam_id = self.model.camera("head_cam").id
             except KeyError:
                 print(">>> 이 씬에는 head_cam 이 없다. "
-                      "--model_path 를 scene_obstacles.xml 로 줄 것.")
+                      "--model_path 를 scene_person.xml 로 줄 것.")
                 self.follow = False
-                return
+                self.goto = False
+                return None
             self.follow_rend = mujoco.Renderer(self.model, height=240, width=320)
             print(">>> 추종용 렌더러 생성 (320x240)")
-
-        # 영상은 한 번만 찍어 색추종과 바닥스캔이 **같은 프레임**을 본다.
-        # 따로 찍으면 두 판단이 다른 순간의 장면을 근거로 삼게 된다.
         self.follow_rend.update_scene(self.data, camera="head_cam")
-        img = self.follow_rend.render()
+        return self.follow_rend.render()
+
+    def body_yaw_deg(self):
+        """월드 기준 몸통 방위(도). 실기에서는 자이로 z 적분으로 얻는다."""
+        q = self.get_floating_base_qpos(self.data.qpos)[3:7]
+        return float(np.degrees(np.arctan2(2 * (q[0] * q[3] + q[1] * q[2]),
+                                           1 - 2 * (q[2] ** 2 + q[3] ** 2))))
+
+    def place(self, start=None, start_yaw_deg=None, person=None):
+        """출발점·출발 방위·사람(=도착점)을 세팅한다. full_reset 뒤에 부를 것.
+
+        출발 방위를 돌려놓을 수 있어야 한다. 사람을 항상 정면에 두고 시작하면
+        그냥 직진해도 도착해서, 스스로 찾아간 건지 알 수가 없다.
+        """
+        if start is not None or start_yaw_deg is not None:
+            qpos = self.data.qpos
+            base = self.get_floating_base_qpos(qpos).copy()
+            if start is not None:
+                base[0], base[1] = float(start[0]), float(start[1])
+            if start_yaw_deg is not None:
+                h = np.radians(float(start_yaw_deg)) / 2.0
+                base[3:7] = [np.cos(h), 0.0, 0.0, np.sin(h)]
+            self.set_floating_base_qpos(base, qpos)
+        if person is not None:
+            self.data.mocap_pos[0] = [float(person[0]), float(person[1]), 0.0]
+            self.goal = (float(person[0]), float(person[1]))
+        mujoco.mj_forward(self.model, self.data)
+
+    def start_goto(self, goal=None):
+        """지금 자리에서 출발해 도착점까지 간다. goal 은 어느 쪽으로 돌지에만 쓴다."""
+        if goal is not None:
+            self.goal = (float(goal[0]), float(goal[1]))
+        self.goto = True
+        self.follow = False
+        self.goto_phase = "scan"
+        self.goto_seen = 0
+        self.scan_steps = 0
+        self.follow_dist = float("nan")
+        self.follow_lost = 0
+        self.avoid_side = 0
+        self.target_world_deg = None
+        self.commands[0:3] = [0.0, 0.0, 0.0]
+
+        # 어느 쪽으로 돌지 한 번만 고른다. 도착점을 알면 가까운 쪽으로 돌고,
+        # 모르면 왼쪽으로 돈다. 반대로 돌면 사람을 찾는 데 최대 두 배 걸린다.
+        self.scan_sign = 1.0
+        if self.goal is not None:
+            base = self.get_floating_base_qpos(self.data.qpos)
+            gb = np.degrees(np.arctan2(self.goal[1] - base[1],
+                                       self.goal[0] - base[0])) - self.body_yaw_deg()
+            gb = (gb + 180.0) % 360.0 - 180.0
+            self.scan_sign = 1.0 if gb >= 0 else -1.0
+            print(f">>> 목표 ({self.goal[0]:.2f}, {self.goal[1]:.2f}) / "
+                  f"몸통 기준 {gb:+.0f}도, {'왼' if gb >= 0 else '오른'}쪽으로 훑는다")
+        print(">>> 자율 이동 ON : 제자리에서 돌며 사람을 찾는 중")
+
+    def goto_step(self):
+        """제자리 선회로 사람을 찾고, 찾으면 추종에 넘긴다.
+
+        사람을 찾은 뒤로는 `follow_step` 을 **그대로** 쓴다. 여기서 주행 코드를
+        새로 쓰면 뷰어의 F(추종)와 N(자율 이동)이 서로 다르게 굴러서, 한쪽에서
+        고친 게 다른 쪽에 안 붙는다. 이 파일에서 이미 한 번 데인 실수다.
+        """
+        img = self.render_head()
+        if img is None:
+            return
+
+        if self.goto_phase == "scan":
+            res = _band_tracker().track(
+                img, float(self.model.cam_fovy[self.follow_cam_id]))
+            self.scan_steps += 1
+            if res is None:
+                self.goto_seen = 0
+            else:
+                self.goto_seen += 1
+            if self.goto_seen < self.GOTO_LOCK_N:
+                # 아직. 서서 돈다. 머리는 정면에 둔다 — 머리까지 같이 돌면
+                # 몸통 기준 어느 쪽에서 찾았는지가 흐려진다.
+                self.commands[0] = 0.0
+                self.commands[1] = 0.0
+                self.commands[2] = self.FOLLOW_SEARCH * self.scan_sign
+                if self.head_track:
+                    self.commands[5] = 0.0
+                return
+            self.goto_phase = "go"
+            print(f">>> 사람 발견 (방위 {res['bearing_deg']:+.0f}도, "
+                  f"{res['distance_m']:.2f} m, 선회 "
+                  f"{self.scan_steps * self.sim_dt * self.decimation:.1f}초) : 출발")
+
+        if self.goto_phase == "arrived":
+            self.commands[0:3] = [0.0, 0.0, 0.0]
+            return
+
+        # 찍어 둔 프레임을 그대로 넘긴다. 여기서 다시 찍으면 한 제어스텝에 두 번
+        # 렌더링하는 셈이라 그냥 느려진다.
+        self.follow_step(img=img)
+
+        # ── 언제 섰다고 할 것인가 ────────────────────────────────────────
+        # 카메라 거리(`follow_dist`)만 보고 서면 안 된다. 그 값은 **양쪽 밴드를
+        # 합친 덩어리의 가로폭**으로 낸 것이라, 비스듬히 보면 두 발목이 겹쳐
+        # 폭이 줄고 거리가 부풀려진다. 실측: 참값 1.92 m 일 때 2.18 m,
+        # 화면 가장자리에 걸리면 8.48 m 까지 튄다.
+        #
+        # 가까이서 더 나쁘다. 카메라는 0.375 m 높이에 10° 숙여 있고 밴드는
+        # 0.09 m 라, 0.4 m 안쪽이면 밴드가 화각 아래로 빠져 아예 안 보인다.
+        # 그래서 추정거리가 0.55 에 닿기 전에 표적을 잃고, 오리는 사람을
+        # 지나쳐 계속 걸어갔다 (실제로 목표 (-1.2, 1.5) 에서 0.36 m 까지
+        # 파고들고도 도착 판정이 안 났다).
+        #
+        # 도착점 좌표를 알면 그걸로 선다. 방향은 눈으로 잡고, 정지는 좌표로
+        # 한다 — 각자 잘하는 것만 시킨다.
+        # 둘 중 **먼저 닿는 쪽**으로 선다. 하나만 보면 둘 다 막힌다:
+        #   카메라만  -> 밴드가 화각 아래로 빠지면 영영 0.55 에 안 닿아 지나친다.
+        #   좌표만    -> 카메라가 먼저 "다 왔다"며 다리를 세워 버리는데
+        #                (follow_step 의 FOLLOW_STOP_M) 좌표로는 0.60 m 라
+        #                판정이 안 나고 그 자리에 굳는다. 실제로 그랬다.
+        base = self.get_floating_base_qpos(self.data.qpos)
+        d, why = self.follow_dist, "카메라"
+        if self.goal is not None:
+            dg = float(np.hypot(self.goal[0] - base[0], self.goal[1] - base[1]))
+            if not (d == d) or dg < d:
+                d, why = dg, "좌표"
+        if d == d and d < self.FOLLOW_STOP_M:
+            self.goto_phase = "arrived"
+            self.commands[0:3] = [0.0, 0.0, 0.0]
+            print(f">>> 도착 : {why} 기준 {d:.2f} m "
+                  f"(오리 {base[0]:.2f}, {base[1]:.2f})")
+
+    def follow_step(self, img=None):
+        """머리 카메라로 사람을 찾아 속도 명령을 만든다. 정책은 그대로 둔다.
+
+        지각은 정책 밖의 층이라 재학습이 필요 없다. 정책은 자기가 받는 3개 숫자가
+        사람이 누른 방향키에서 왔는지 카메라에서 왔는지 구분하지 못한다.
+        """
+        band_tracker = _band_tracker()
+        if img is None:
+            img = self.render_head()
+            if img is None:
+                return
         res = band_tracker.track(img, float(self.model.cam_fovy[self.follow_cam_id]))
 
-        # 월드 기준 몸통 방위. 실기에서는 자이로 z 적분으로 얻는다.
-        q = self.get_floating_base_qpos(self.data.qpos)[3:7]
-        body_yaw = np.degrees(np.arctan2(2 * (q[0] * q[3] + q[1] * q[2]),
-                                         1 - 2 * (q[2] ** 2 + q[3] ** 2)))
+        body_yaw = self.body_yaw_deg()
 
         if res is None:
             # 놓쳤다. 월드 기준으로 어디 있었는지 기억하고 있으면 그쪽으로 돈다.
@@ -417,6 +604,7 @@ class MjInfer(MJInferBase):
                 self.commands[2] = self.FOLLOW_SEARCH * self.follow_last_sign
             return
         self.follow_lost = 0
+        self.follow_dist = float(res["distance_m"])
         self.follow_last_sign = 1.0 if res["bearing_deg"] >= 0 else -1.0
 
         # ── 좌표계 ────────────────────────────────────────────────────────
@@ -568,7 +756,9 @@ class MjInfer(MJInferBase):
                 DANCES[self.dance][1](self.dance_t)
             )
 
-        if self.follow:
+        if self.goto:
+            self.goto_step()
+        elif self.follow:
             self.follow_step()
 
         obs = self.get_obs(
@@ -681,6 +871,17 @@ if __name__ == "__main__":
         default=False,
         help="레퍼런스 정합 명령 범위를 쓴다 (fast / rough 정책용)",
     )
+    parser.add_argument("--start", type=float, nargs=2, default=None,
+                        help="출발점 x y")
+    parser.add_argument("--start_yaw", type=str, default=None,
+                        help="출발 방위(도). 사람을 등지고 시작시키려면 180. "
+                             "'random' 이면 매 실행 아무 방향이나 보고 선다")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="--start_yaw random 을 재현하고 싶을 때")
+    parser.add_argument("--person", type=float, nargs=2, default=None,
+                        help="사람(=도착점) x y")
+    parser.add_argument("--goto", action="store_true", default=False,
+                        help="켜고 시작한다 (뷰어에서 N 키를 누른 것과 같다)")
 
     args = parser.parse_args()
 
@@ -691,4 +892,17 @@ if __name__ == "__main__":
         args.standing,
         args.ref_range,
     )
+    yaw = args.start_yaw
+    if yaw is not None:
+        if yaw.lower() == "random":
+            # 아무 방향이나 보고 시작한다. 이게 실제 조건에 가깝다 — 켰을 때
+            # 오리가 사람 쪽을 보고 있을 이유가 없다.
+            rng = np.random.default_rng(args.seed)
+            yaw = float(rng.uniform(-180.0, 180.0))
+            print(f">>> 출발 방위 무작위: {yaw:+.0f}도")
+        else:
+            yaw = float(yaw)
+    mjinfer.place(args.start, yaw, args.person)
+    if args.goto:
+        mjinfer.start_goto()
     mjinfer.run()
