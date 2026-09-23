@@ -135,6 +135,20 @@ class MjInfer(MJInferBase):
         self.direct_head = False
         self.dance = None       # None 이면 춤 안 춤. 아니면 DANCES 의 인덱스
         self.dance_t = 0.0
+
+        # ── 방위 유지 (K 키) ──────────────────────────────────────────────
+        # 어떤 정책도 쏠림이 0 이 아니다. 원본조차 ±1.86 에서 1°/s 쯤 오른쪽으로
+        # 밀린다 (SIM_NOTES "쏠림은 계통 편향인가"). 재학습으로 0 을 만드는 대신,
+        # 사람 추종과 **같은 구조**로 정책 밖에서 잡는다 — 방위 오차를 요 명령에
+        # 물릴 뿐 정책은 건드리지 않는다. Q/E 를 누르면 그 방위를 새 기준으로 삼는다.
+        # 실기에서는 자이로 z 적분이라 기준이 서서히 흐르지만, 직진 구간 몇십 초를
+        # 버티는 용도라 충분하다.
+        self.heading_hold = False
+        self.heading_target = None
+        self.HEADING_KP = 0.02        # 도당 요 명령 (FOLLOW_KP 와 같은 눈금)
+        self.HEADING_MAX = 0.5        # 이보다 세게는 안 민다
+        self.user_ang = 0.0           # 키로 직접 준 요 명령
+        self._hold_injected = 0.0     # 직전에 제가 써 넣은 요 명령 (소유권 판정용)
         # 머리 목표값은 따로 들고 있는다. prev_motor_targets 는 정책 목표로 이미
         # 덮인 뒤라, 그걸 기준으로 속도 제한을 걸면 머리가 사실상 안 움직인다.
         self.prev_head = np.array(self.default_actuator[5:9], dtype=float).copy()
@@ -322,8 +336,49 @@ class MjInfer(MJInferBase):
         self.goto_phase = "scan"
         self.goto_seen = 0
         self.follow_dist = float("nan")
+        self.heading_target = None
+        self.user_ang = 0.0
+        self._hold_injected = 0.0
         self.track_reset()
         print(">>> RESET : home keyframe + policy state cleared")
+
+    def heading_step(self):
+        """방위 유지 (K). 안 시켰는데 도는 만큼을 요 명령으로 되민다.
+
+        정책은 건드리지 않는다 — 사람 추종이 카메라 방위각을 요 명령에 물리는 것과
+        같은 층이다. 끄면(기본) 아무 일도 안 한다.
+
+        **요 명령의 소유권을 추적한다.** `commands[2]` 가 직전에 제가 써 넣은 값
+        그대로면 아무도 안 건드린 것이니 계속 밀고, 값이 다르면 바깥(키 입력이든
+        eval 스크립트든)이 돌라고 시킨 것이니 손을 뗀다. 안 그러면 제자리 회전
+        명령을 제가 지워버린다 (실제로 469.7° 짜리 회전이 -1.6° 가 됐다).
+
+        돌라고 시킨 동안에는 기준을 따라 옮겨서, 손을 떼면 그 자리에서 새 방위를
+        지킨다. 제자리(전후·좌우 명령이 0)에서는 안 민다 — 제자리 선회는 문턱이
+        높아서(SIM_NOTES) 작은 명령이 아무 일도 못 한다.
+        """
+        if not self.heading_hold:
+            return
+        commanded = self.commands[2] != self._hold_injected or self.user_ang != 0
+        if commanded:
+            # 바깥이 요를 쥐고 있다. 기준만 따라 옮기고 명령은 그대로 둔다.
+            self.heading_target = self._yaw_now()
+            self._hold_injected = 0.0
+            return
+        if abs(self.commands[0]) < 1e-6 and abs(self.commands[1]) < 1e-6:
+            self.heading_target = self._yaw_now()
+            self.commands[2] = 0.0
+            self._hold_injected = 0.0
+            return
+        if self.heading_target is None:
+            self.heading_target = self._yaw_now()
+        err = np.degrees(
+            (self.heading_target - self._yaw_now() + np.pi) % (2 * np.pi) - np.pi
+        )
+        self.commands[2] = float(
+            np.clip(self.HEADING_KP * err, -self.HEADING_MAX, self.HEADING_MAX)
+        )
+        self._hold_injected = self.commands[2]
 
     def track_reset(self):
         """리셋 지점 기준의 이동/회전 누적을 다시 0 으로."""
@@ -386,6 +441,14 @@ class MjInfer(MJInferBase):
             self.dance = None
             self.commands[3:] = [0.0, 0.0, 0.0, 0.0]
             print(">>> 춤 정지")
+            return
+        if keycode == 75:  # k : 방위 유지 on/off
+            self.heading_hold = not self.heading_hold
+            self.heading_target = self._yaw_now() if self.heading_hold else None
+            print(">>> 방위 유지 {} {}".format(
+                "ON" if self.heading_hold else "OFF",
+                "(지금 보는 쪽을 기준으로 잡는다. Q/E 로 기준을 바꾼다)"
+                if self.heading_hold else ""))
             return
         if keycode == 71:  # g : 머리로 표적 붙들기 on/off
             self.head_track = not self.head_track
@@ -467,6 +530,11 @@ class MjInfer(MJInferBase):
             self.commands[5] = head_yaw
             self.commands[6] = head_roll
 
+        self.user_ang = ang_vel
+        if self.heading_hold and ang_vel != 0:
+            # 사람이 직접 돌리는 동안은 기준을 따라 움직인다. 안 그러면 손을
+            # 떼는 순간 원래 방위로 되돌아가 버린다.
+            self.heading_target = self._yaw_now()
         self.commands[0] = lin_vel_x
         self.commands[1] = lin_vel_y
         self.commands[2] = ang_vel
@@ -777,6 +845,7 @@ class MjInfer(MJInferBase):
 
         mj_step 과 화면 갱신은 부르는 쪽 몫이다.
         """
+        self.heading_step()
         if not self.standing:
             self.imitation_i += 1.0 * self.phase_frequency_factor
             self.imitation_i = (
@@ -952,6 +1021,10 @@ if __name__ == "__main__":
                         help="사람(=도착점) x y")
     parser.add_argument("--goto", action="store_true", default=False,
                         help="켜고 시작한다 (뷰어에서 N 키를 누른 것과 같다)")
+    parser.add_argument("--no_heading_hold", action="store_true", default=False,
+                        help="방위 유지를 끈 채로 시작한다. 뷰어는 켜고 시작하는데, "
+                             "정책 자체의 쏠림을 보고 싶으면 꺼야 한다 "
+                             "(eval_* 스크립트는 항상 꺼져 있다)")
     parser.add_argument("--direct_head", action="store_true", default=False,
                         help="머리를 정책 대신 명령으로 직접 구동한 채 시작한다 "
                              "(T 키와 같다). 머리는 움직이지만 걸음이 왼쪽으로 휜다")
@@ -975,11 +1048,16 @@ if __name__ == "__main__":
         )
         print(f">>> forcerange ±{args.forcerange} N·m")
     mjinfer.direct_head = args.direct_head
+    # 라이브러리 기본값은 꺼짐이고, **뷰어에서만** 켜고 시작한다. eval_* 은
+    # MjInfer 를 직접 만들어 쓰므로 정책 맨몸을 그대로 잰다.
+    mjinfer.heading_hold = not args.no_heading_hold
     # 조건을 매번 찍는다. 토크·머리모드·씬 셋 다 조용히 어긋나서 "왼쪽으로 돈다"
     # 를 만든 적이 있다. 보이면 안 어긋난다.
     print(">>> 씬 {}".format(os.path.basename(args.model_path)))
     print(">>> 머리 직접 구동 {} (T 로 토글)".format(
         "ON — 걸음이 휜다" if args.direct_head else "OFF"))
+    print(">>> 방위 유지 {} (K 로 토글)".format(
+        "OFF — 정책 쏠림이 그대로 보인다" if args.no_heading_hold else "ON"))
     yaw = args.start_yaw
     if yaw is not None:
         if yaw.lower() == "random":
