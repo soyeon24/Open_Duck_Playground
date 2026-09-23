@@ -123,8 +123,16 @@ class MjInfer(MJInferBase):
 
         self.phase_frequency_factor = 1.0
 
-        # 머리 4축을 정책 대신 명령으로 직접 구동할지 (T 키로 토글)
-        self.direct_head = True
+        # 머리 4축을 정책 대신 명령으로 직접 구동할지 (T 키로 토글).
+        #
+        # ⚠ 기본값이 True 였는데 **그것만으로 걸음이 왼쪽으로 휜다.** 머리를
+        # 명령으로 home 에 붙들면 정책이 보는 머리 관절 상태가 제가 낸 것과
+        # 달라지고, 그 어긋남이 요 드리프트로 쌓인다. 원본 정책 40초 전진에서
+        # ±1.86 기준 True 면 +305.6°, False 면 −26.7° 다 (backlash 씬).
+        # `eval_walk.py` 는 처음부터 False 로 쟀는데 뷰어만 True 로 떠 있어서,
+        # 눈으로 본 것과 잰 숫자가 반대 방향으로 갈렸다.
+        # 춤(1~5)과 추종(F/N)은 필요할 때 자기가 켠다. T 로 직접 켤 수도 있다.
+        self.direct_head = False
         self.dance = None       # None 이면 춤 안 춤. 아니면 DANCES 의 인덱스
         self.dance_t = 0.0
         # 머리 목표값은 따로 들고 있는다. prev_motor_targets 는 정책 목표로 이미
@@ -314,7 +322,47 @@ class MjInfer(MJInferBase):
         self.goto_phase = "scan"
         self.goto_seen = 0
         self.follow_dist = float("nan")
+        self.track_reset()
         print(">>> RESET : home keyframe + policy state cleared")
+
+    def track_reset(self):
+        """리셋 지점 기준의 이동/회전 누적을 다시 0 으로."""
+        base = self.get_floating_base_qpos(self.data.qpos)
+        self._t_p0 = base[:3].copy()
+        self._t_y0 = self._yaw_now()
+        self._t_yaw_prev = self._t_y0
+        self._t_yaw_acc = 0.0
+        self._t_steps = 0
+
+    def _yaw_now(self):
+        w, x, y, z = self.get_floating_base_qpos(self.data.qpos)[3:7]
+        return np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+    def track_step(self, every=50):
+        """제어 스텝마다 불러 누적을 갱신하고, 1초에 한 줄 찍는다.
+
+        뷰어로 보면 "왼쪽으로 좀 도는 것 같다" 까지밖에 안 나온다. 눈으로 본 것과
+        `eval_walk.py` 가 낸 숫자가 어긋나면 어느 쪽이 틀렸는지 가릴 방법이 없어서,
+        보는 사람이 같은 숫자를 읽을 수 있게 뷰어가 직접 찍는다.
+
+        요는 매 스텝 차분을 누적한다. 시작과 끝 자세만 빼면 180도를 넘는 회전이
+        반대 부호로 접힌다 (+ 가 왼쪽, - 가 오른쪽).
+        """
+        yn = self._yaw_now()
+        self._t_yaw_acc += (yn - self._t_yaw_prev + np.pi) % (2 * np.pi) - np.pi
+        self._t_yaw_prev = yn
+        self._t_steps += 1
+        if self._t_steps % every:
+            return
+        d = self.get_floating_base_qpos(self.data.qpos)[:3] - self._t_p0
+        fwd = d[0] * np.cos(self._t_y0) + d[1] * np.sin(self._t_y0)
+        lat = -d[0] * np.sin(self._t_y0) + d[1] * np.cos(self._t_y0)
+        deg = np.rad2deg(self._t_yaw_acc)
+        side = "왼쪽" if deg > 0 else "오른쪽"
+        print("[{:5.1f}s] 명령 x{:+.2f} y{:+.2f} th{:+.2f} | 전진 {:+6.1f}cm "
+              "횡 {:+6.1f}cm | 누적 요 {:+7.1f}° ({})".format(
+                  self._t_steps / 50.0, self.commands[0], self.commands[1],
+                  self.commands[2], fwd * 100, lat * 100, deg, side))
 
     def key_callback(self, keycode):
         print(f"key: {keycode}")
@@ -326,7 +374,7 @@ class MjInfer(MJInferBase):
         if keycode == 84:  # t : 머리 직접 구동 on/off
             self.direct_head = not self.direct_head
             print(f">>> 머리 직접 구동 {'ON' if self.direct_head else 'OFF'} "
-                  f"(OFF 면 정책에 맡기는데, 지금 정책은 머리 명령을 무시한다)")
+                  f"({'ON 이면 머리가 명령을 따르지만 걸음이 휜다' if self.direct_head else 'OFF 가 기본. 2026-09-04 이전 정책은 머리 명령을 무시한다'})")
             return
         if 49 <= keycode <= 53:  # 1~5 : 안무 선택
             self.dance = keycode - 49
@@ -470,6 +518,8 @@ class MjInfer(MJInferBase):
             self.data.mocap_pos[0] = [float(person[0]), float(person[1]), 0.0]
             self.goal = (float(person[0]), float(person[1]))
         mujoco.mj_forward(self.model, self.data)
+        # 몸통을 옮겨 놨으므로 누적의 기준점도 여기로 옮긴다.
+        self.track_reset()
 
     def start_goto(self, goal=None):
         """지금 자리에서 출발해 도착점까지 간다. goal 은 어느 쪽으로 돌지에만 쓴다."""
@@ -823,6 +873,8 @@ class MjInfer(MJInferBase):
         else:
             self.render_head()
 
+        # full_reset 없이 바로 run() 으로 들어오는 경로가 있어서 여기서 한 번 잡는다.
+        self.track_reset()
         try:
             with mujoco.viewer.launch_passive(
                 self.model,
@@ -842,6 +894,7 @@ class MjInfer(MJInferBase):
 
                     if counter % self.decimation == 0:
                         self.control_step()
+                        self.track_step()
 
                         # 화면 갱신은 제어 주기(50Hz)에 맞춘다. 원래는 물리
                         # 스텝마다, 즉 초당 500번 sync 했는데 화면은 60Hz면
@@ -875,7 +928,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_path",
         type=str,
-        default="playground/open_duck_mini_v2/xmls/scene_flat_terrain.xml",
+        # 기본값이 백래시 없는 씬이었다. from_ubai 의 정책은 **전부**
+        # scene_flat_terrain_backlash.xml 로 학습됐고(슬럼 로그의 xml: 줄),
+        # 백래시 없는 모델로 굴리면 걸음이 달라진다 — 원본 정책 40초 전진에서
+        # 쏠림이 -26.7° 대 -102.8° 로 갈린다.
+        default="playground/open_duck_mini_v2/xmls/scene_flat_terrain_backlash.xml",
     )
     parser.add_argument("--standing", action="store_true", default=False)
     parser.add_argument(
@@ -895,6 +952,9 @@ if __name__ == "__main__":
                         help="사람(=도착점) x y")
     parser.add_argument("--goto", action="store_true", default=False,
                         help="켜고 시작한다 (뷰어에서 N 키를 누른 것과 같다)")
+    parser.add_argument("--direct_head", action="store_true", default=False,
+                        help="머리를 정책 대신 명령으로 직접 구동한 채 시작한다 "
+                             "(T 키와 같다). 머리는 움직이지만 걸음이 왼쪽으로 휜다")
     parser.add_argument("--forcerange", type=float, default=None,
                         help="토크 상한[N·m]. 씬 XML 은 ±3.23 으로 고정돼 있는데 "
                              "fr186 계열은 ±1.86 으로 학습됐다. 학습값과 다르게 "
@@ -914,6 +974,12 @@ if __name__ == "__main__":
             [-args.forcerange, args.forcerange]
         )
         print(f">>> forcerange ±{args.forcerange} N·m")
+    mjinfer.direct_head = args.direct_head
+    # 조건을 매번 찍는다. 토크·머리모드·씬 셋 다 조용히 어긋나서 "왼쪽으로 돈다"
+    # 를 만든 적이 있다. 보이면 안 어긋난다.
+    print(">>> 씬 {}".format(os.path.basename(args.model_path)))
+    print(">>> 머리 직접 구동 {} (T 로 토글)".format(
+        "ON — 걸음이 휜다" if args.direct_head else "OFF"))
     yaw = args.start_yaw
     if yaw is not None:
         if yaw.lower() == "random":
