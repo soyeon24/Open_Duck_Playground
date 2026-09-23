@@ -895,6 +895,10 @@ if __name__ == "__main__":
                         help="사람(=도착점) x y")
     parser.add_argument("--goto", action="store_true", default=False,
                         help="켜고 시작한다 (뷰어에서 N 키를 누른 것과 같다)")
+    parser.add_argument("--forcerange", type=float, default=None,
+                        help="토크 상한[N·m]. 씬 XML 은 ±3.23 으로 고정돼 있는데 "
+                             "fr186 계열은 ±1.86 으로 학습됐다. 학습값과 다르게 "
+                             "굴리면 걸음이 딴판이 된다 (fr186 은 3.23 에서 왼쪽으로 원을 그린다)")
 
     args = parser.parse_args()
 
@@ -905,6 +909,11 @@ if __name__ == "__main__":
         args.standing,
         args.ref_range,
     )
+    if args.forcerange is not None:
+        mjinfer.model.actuator_forcerange[:] = np.array(
+            [-args.forcerange, args.forcerange]
+        )
+        print(f">>> forcerange ±{args.forcerange} N·m")
     yaw = args.start_yaw
     if yaw is not None:
         if yaw.lower() == "random":
