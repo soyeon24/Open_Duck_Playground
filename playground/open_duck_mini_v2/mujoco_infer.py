@@ -810,6 +810,19 @@ class MjInfer(MJInferBase):
         self.data.ctrl = self.motor_targets.copy()
 
     def run(self):
+        # 오프스크린 렌더러를 **뷰어보다 먼저** 만든다.
+        #
+        # 뷰어가 떠 있는 상태에서 mujoco.Renderer 를 만들면 세그폴트(139)로
+        # 죽는다. 자율 이동을 켜고 띄운 창이 실제로 그렇게 날아갔다 — 출력이
+        # 버퍼에 남은 채라 로그도 안 남는다. 순서만 뒤집으면 F/N 을 도중에
+        # 눌러도 새로 만들 게 없다.
+        try:
+            self.model.camera("head_cam")
+        except KeyError:
+            pass            # 카메라 없는 씬은 추종 자체가 안 되므로 그냥 둔다
+        else:
+            self.render_head()
+
         try:
             with mujoco.viewer.launch_passive(
                 self.model,
