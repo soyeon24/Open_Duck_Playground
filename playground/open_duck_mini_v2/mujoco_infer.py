@@ -15,6 +15,35 @@ from playground.open_duck_mini_v2.mujoco_infer_base import MJInferBase
 
 USE_MOTOR_SPEED_LIMITS = True
 
+# ── 기본 정책 (2026-09-28 부터 hp0dy2 시드 0, 잡 994830) ─────────────────────
+# 정책 파일과 **학습 조건 셋(전진·게걸음 범위, 토크 상한)을 한 묶음으로** 둔다.
+# 파일만 바꾸고 조건을 안 맞추면 학습 때와 다른 입력을 받아 걸음이 딴판이 된다 —
+# fr186 을 3.23 에서 재서 "원을 그린다" 고 적은 게 그 예다 (SIM_NOTES 09-23).
+# 정격 1.86 에서 전진 181 cm/12 s, 제자리 회전 380°, 빈 바닥 찾아가기 4/4 (9.6~18.9초).
+# 제자리 게걸음은 못 한다 (0.2 cm). SIM_NOTES "994830 / 994831 결과".
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+DEFAULT_POLICY = dict(
+    onnx=os.path.join(_PROJECT_ROOT, "from_ubai",
+                      "hp0dy2_2026_09_28_102045_300482560.onnx"),
+    ref_range=True,      # 전진 [-0.148, 0.222]
+    lin_vel_y=0.2,       # 게걸음은 원본 범위
+    forcerange=1.86,     # 학습은 관절별 U(1.40, 1.90), 실물 정격이 1.86
+)
+
+
+def resolve_policy(onnx=None, ref_range=False, lin_vel_y=None, forcerange=None):
+    """정책 파일을 안 주면 기본 정책을 **학습 조건째로** 돌려준다. 주면 받은 그대로.
+
+    뷰어·eval_goto·eval_follow·make_video 가 모두 이걸 거친다. 한 곳에서만 고치면
+    나머지가 옛 정책으로 조용히 남는 걸 막으려는 것이다.
+    """
+    if onnx is not None:
+        return onnx, ref_range, lin_vel_y, forcerange
+    d = DEFAULT_POLICY
+    return (d["onnx"], d["ref_range"],
+            d["lin_vel_y"] if lin_vel_y is None else lin_vel_y,
+            d["forcerange"] if forcerange is None else forcerange)
+
 
 def _band_tracker():
     """band_tracker.py 를 불러온다.
@@ -73,6 +102,7 @@ class MjInfer(MJInferBase):
         onnx_model_path: str,
         standing: bool,
         ref_range: bool = False,
+        lin_vel_y: float = None,
     ):
         super().__init__(model_path)
 
@@ -103,6 +133,10 @@ class MjInfer(MJInferBase):
         else:
             self.COMMANDS_RANGE_X = [-0.15, 0.15]
             self.COMMANDS_RANGE_Y = [-0.2, 0.2]
+        # 게걸음 범위만 따로 준다. 2026-09-28 잡(hp0dy2)은 전진은 정합값 0.222,
+        # 게걸음은 원본 0.2 로 학습해서 위 두 모드 어느 쪽과도 안 맞는다.
+        if lin_vel_y is not None:
+            self.COMMANDS_RANGE_Y = [-float(lin_vel_y), float(lin_vel_y)]
         self.COMMANDS_RANGE_THETA = [-1.0, 1.0]
 
         self.NECK_PITCH_RANGE = [-0.34, 1.1]
@@ -195,6 +229,30 @@ class MjInfer(MJInferBase):
         # 매 프레임 새로 고르면, 몸을 틀자마자 장애물이 정면에서 빠지고 다시
         # 표적 쪽으로 꺾여서 결국 장애물 옆구리로 박는다. 실제로 그렇게 됐다.
         self.avoid_side = 0
+        # 본 장애물을 월드 좌표로 기억한다 (floor_scan.ObstacleMemory).
+        # 카메라는 0.54 m 안쪽 바닥을 못 봐서, 18 cm 벽에 30 cm 까지 붙으면 벽 너머
+        # 바닥을 보고 "비었다" 고 한다. 기억 없이는 거기서 우회를 풀고 벽으로 직진해
+        # 벽 앞에 붙은 채 끝났다 (2026-09-28, eval_goto --avoid 0/4).
+        self.obs_memory = True
+        self.obs_mem = None               # 필요할 때 만든다. None 으로 두면 초기화
+        # 우회를 방향(steer)이 아니라 월드 좌표 경유점으로 한다 (floor_scan.detour_waypoint).
+        # 방향만 주면 정책이 덜 꺾은 만큼 오차가 쌓여 모서리를 못 비켰다.
+        # 경유점은 기억(obs_memory)을 쓰므로 기억이 켜져 있어야 동작한다.
+        self.waypoint_detour = True
+        self.detour_wp = None             # 지금 향하는 경유점 (표시·채점용)
+        # 경유점으로 갈 때의 명령. 기본 정책 실측 (2026-09-28, 정격 1.86):
+        #   전진 0.07 은 회전을 얼마를 얹든 거의 제자리 — **0.1 미만은 사각지대**다.
+        #   전진 0.15 는 회전을 얹어도 12 cm/s 를 유지하고, 회전 0.5 -> 31°/s,
+        #   1.0 -> 58°/s 로 명령에 비례한다 (최소 회전반경 약 12 cm).
+        # 그래서 전진은 0.15 로 고정하고 방향은 회전으로만 잡는다.
+        self.WP_VX = 0.15
+        self.WP_KP = 0.025                # 경유점 방위 1° 당 요 명령
+        # 코앞에 장애물이 있으면 전진하지 않고 제자리에서 경유점 쪽으로 먼저 돈다.
+        # 이 정책은 **뒤로 못 걷고** (후진 명령 -0.148 에 0 cm/s), 벽에 몸이 닿으면
+        # 제자리 회전도 걸려서 25초에 26° 밖에 못 돈다. 그러니 닿기 전에 서야 한다.
+        # 몸통 중심에서 앞쪽 이 거리 안, 좌우 반폭 안에 기억된 점이 있으면 선다.
+        self.WP_GUARD_M = 0.22
+        self.WP_GUARD_HALF_W = 0.14
 
         # 머리로 표적 붙들기 (G 키). 몸이 우회해도 사람을 계속 본다.
         # 화각 절반이 약 31° 이므로 그보다 작게 묶어야 몸통 정면이 시야에 남는다.
@@ -315,6 +373,8 @@ class MjInfer(MJInferBase):
         key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "home")
         mujoco.mj_resetDataKeyframe(self.model, self.data, key_id)
         self.data.ctrl[:] = self.default_actuator
+        self.obs_mem = None               # 이전 판에서 본 장애물은 잊는다
+        self.detour_wp = None
         mujoco.mj_forward(self.model, self.data)
 
         self.last_action = np.zeros(self.num_dofs)
@@ -474,6 +534,7 @@ class MjInfer(MJInferBase):
             self.follow = not self.follow
             self.follow_lost = 0
             self.avoid_side = 0
+            self.obs_mem = None
             self.target_world_deg = None
             if not self.follow:
                 self.commands[0:3] = [0.0, 0.0, 0.0]
@@ -602,6 +663,7 @@ class MjInfer(MJInferBase):
         self.follow_lost = 0
         self.avoid_side = 0
         self.target_world_deg = None
+        self.obs_mem = None
         self.commands[0:3] = [0.0, 0.0, 0.0]
 
         # 어느 쪽으로 돌지 한 번만 고른다. 도착점을 알면 가까운 쪽으로 돌고,
@@ -632,6 +694,9 @@ class MjInfer(MJInferBase):
             res = _band_tracker().track(
                 img, float(self.model.cam_fovy[self.follow_cam_id]))
             self.scan_steps += 1
+            # 도는 동안 장애물도 훑어 둔다. 출발 전에 주변 지도를 채우는 셈이다.
+            if self.avoid and self.obs_memory:
+                self.see_obstacles(img)
             if res is None:
                 self.goto_seen = 0
             else:
@@ -689,6 +754,63 @@ class MjInfer(MJInferBase):
             print(f">>> 도착 : {why} 기준 {d:.2f} m "
                   f"(오리 {base[0]:.2f}, {base[1]:.2f})")
 
+    def _wp_turn(self, bearing_deg, vx):
+        """경유점 방위로 요 명령을 낸다. 제자리(vx=0)면 사각지대를 건너뛴다.
+
+        제자리 회전은 0.5 미만이 사각지대다 (FOLLOW_SEARCH 주석). 전진 중에는 작은
+        값도 먹지만, 서서 0.3 을 주면 그대로 굳는다 — 실제로 경유점을 12° 남기고
+        30초를 서 있었다 (2026-09-28).
+        """
+        ang = float(np.clip(self.WP_KP * bearing_deg,
+                            self.COMMANDS_RANGE_THETA[0], self.COMMANDS_RANGE_THETA[1]))
+        if vx == 0.0 and abs(ang) < 0.8:
+            ang = 0.8 if bearing_deg >= 0 else -0.8
+        return ang
+
+    def _front_blocked(self):
+        """기억된 장애물이 몸통 바로 앞(WP_GUARD_M 안, 좌우 반폭 안)에 있는가."""
+        if self.obs_mem is None or len(self.obs_mem.pts) == 0:
+            return False
+        base = self.get_floating_base_qpos(self.data.qpos)
+        a = np.radians(self.body_yaw_deg())
+        rel = self.obs_mem.pts - base[:2]
+        fwd = rel[:, 0] * np.cos(a) + rel[:, 1] * np.sin(a)
+        lat = -rel[:, 0] * np.sin(a) + rel[:, 1] * np.cos(a)
+        return bool(np.any((fwd > 0.0) & (fwd < self.WP_GUARD_M)
+                           & (np.abs(lat) < self.WP_GUARD_HALF_W)))
+
+    def see_obstacles(self, img):
+        """머리 카메라 한 장으로 바닥 여유거리를 재고, 켜져 있으면 장애물 기억에 넣는다.
+
+        반환: (방위[몸통 프레임, 도], 여유거리[m], 최소 가시거리[m]). 여유거리는
+        기억을 합친 값이다. 추종(follow_step)과 사람 찾기 선회(goto_step 의 scan)가
+        같이 쓴다 — 선회하는 동안 사방을 한 번 훑으므로 그때 기억을 채워 두면,
+        걷다가 몸을 틀어 화면 밖으로 나간 장애물도 이미 알고 있다.
+        """
+        import floor_scan
+        R = self.data.cam_xmat[self.follow_cam_id].reshape(3, 3)
+        f = -R[:, 2]
+        # 실기에서는 이 두 값을 IMU 에서 읽는다. 시뮬이라 카메라 행렬에서 뽑는다.
+        pitch_down = -np.degrees(np.arcsin(np.clip(f[2], -1, 1)))
+        roll = np.degrees(np.arctan2(R[2, 0], R[2, 1]))
+        cam_h = float(self.data.cam_xpos[self.follow_cam_id][2])
+        fovy = float(self.model.cam_fovy[self.follow_cam_id])
+
+        bearings, free = floor_scan.free_space(img, fovy, cam_h, pitch_down, roll)
+        # 카메라 프레임 -> 몸통 프레임. 실기에서 head_yaw 는 서보 엔코더에서 읽는다.
+        head_yaw = np.degrees(self.data.qpos[self.model.joint("head_yaw").qposadr[0]])
+        bearings = bearings + head_yaw
+        blind = floor_scan.min_visible_range(fovy, cam_h, pitch_down)
+        if self.obs_memory:
+            if self.obs_mem is None:
+                self.obs_mem = floor_scan.ObstacleMemory()
+            # bearings 는 몸통 프레임이므로 기준 방위는 몸통 요다.
+            # 실기에서 카메라 위치는 오도메트리로 얻는다.
+            free = self.obs_mem.update(
+                self.data.cam_xpos[self.follow_cam_id][:2], self.body_yaw_deg(),
+                bearings, free, blind)
+        return bearings, free, blind
+
     def follow_step(self, img=None):
         """머리 카메라로 사람을 찾아 속도 명령을 만든다. 정책은 그대로 둔다.
 
@@ -710,6 +832,20 @@ class MjInfer(MJInferBase):
             # 놓치기 직전의 부호를 쓰는 게 핵심이다 — 고정 방향으로 훑으면
             # 표적이 오른쪽으로 사라졌는데 왼쪽으로 도는 일이 생긴다.
             self.follow_lost += 1
+            # 우회 중이면 경유점까지는 간다. 경유점은 월드 좌표라 사람이 안 보여도
+            # 유효하다. 우회하느라 몸을 틀면 사람이 화각 밖으로 빠지기 쉬운데, 그때마다
+            # 서서 사람 쪽으로 돌아버리면 우회가 영영 안 끝난다. 닿으면 놓고 찾는다.
+            if self.avoid and self.detour_wp is not None:
+                base = self.get_floating_base_qpos(self.data.qpos)
+                dx, dy = self.detour_wp - base[:2]
+                if np.hypot(dx, dy) > 0.08:
+                    wb = (np.degrees(np.arctan2(dy, dx)) - body_yaw + 180.0) % 360.0 - 180.0
+                    self.commands[0] = (0.0 if abs(wb) > 90.0 or self._front_blocked()
+                                        else self.WP_VX)
+                    self.commands[1] = 0.0
+                    self.commands[2] = self._wp_turn(wb, self.commands[0])
+                    return
+                self.detour_wp = None
             self.commands[0] = 0.0
             self.commands[1] = 0.0
             if self.target_world_deg is not None:
@@ -738,28 +874,31 @@ class MjInfer(MJInferBase):
 
         if self.avoid:
             import floor_scan
-            R = self.data.cam_xmat[self.follow_cam_id].reshape(3, 3)
-            f = -R[:, 2]
-            # 실기에서는 이 두 값을 IMU 에서 읽는다. 시뮬이라 카메라 행렬에서 뽑는다.
-            pitch_down = -np.degrees(np.arcsin(np.clip(f[2], -1, 1)))
-            roll = np.degrees(np.arctan2(R[2, 0], R[2, 1]))
-            cam_h = float(self.data.cam_xpos[self.follow_cam_id][2])
-
-            bearings, free = floor_scan.free_space(
-                img, float(self.model.cam_fovy[self.follow_cam_id]),
-                cam_h, pitch_down, roll)
-            bearings = bearings + head_yaw      # 카메라 프레임 -> 몸통 프레임
+            bearings, free, blind = self.see_obstacles(img)
 
             # 어차피 갈 표적을 장애물로 보고 피하면 영영 못 간다. 표적보다 가까운
             # 것만 장애물로 친다. 동시에 최소 가시거리보다는 넉넉해야 한다 —
             # 그 안쪽은 카메라가 못 보므로 거기 닿기 전에 결정해야 한다.
-            blind = floor_scan.min_visible_range(
-                float(self.model.cam_fovy[self.follow_cam_id]), cam_h, pitch_down)
             clearance = min(res["distance_m"] - self.AVOID_TARGET_MARGIN,
                             self.AVOID_LOOKAHEAD)
             clearance = max(clearance, blind + self.AVOID_BLIND_MARGIN)
-            go_b, blocked, self.avoid_side = floor_scan.steer(
-                bearings, free, target_b, clearance, prefer_side=self.avoid_side)
+            if self.waypoint_detour and self.obs_mem is not None:
+                # 표적 위치: 자율 이동이면 도착점 좌표, 추종이면 카메라 추정.
+                base = self.get_floating_base_qpos(self.data.qpos)
+                if self.goto and self.goal is not None:
+                    tgt = np.array(self.goal, dtype=float)
+                else:
+                    a = np.radians(self.target_world_deg)
+                    tgt = base[:2] + res["distance_m"] * np.array([np.cos(a), np.sin(a)])
+                self.detour_wp, self.avoid_side = floor_scan.detour_waypoint(
+                    self.obs_mem.pts, base[:2], tgt, side=self.avoid_side)
+                if self.detour_wp is not None:
+                    dx, dy = self.detour_wp - base[:2]
+                    go_b = (np.degrees(np.arctan2(dy, dx)) - body_yaw + 180.0) % 360.0 - 180.0
+            else:
+                self.detour_wp = None
+                go_b, blocked, self.avoid_side = floor_scan.steer(
+                    bearings, free, target_b, clearance, prefer_side=self.avoid_side)
             self.follow_free = float(free[np.argmin(np.abs(bearings))])  # 몸통 정면 여유
 
         # ── 머리로 표적을 붙든다 ──────────────────────────────────────────
@@ -817,7 +956,14 @@ class MjInfer(MJInferBase):
         if abs(sy) > 1e-6:
             v = min(v, self.COMMANDS_RANGE_Y[1] / abs(sy))
 
-        if blocked or res["distance_m"] < self.FOLLOW_STOP_M:
+        if self.avoid and self.detour_wp is not None:
+            # 경유점으로 간다. 몸통을 경유점 쪽으로 틀며 걷는다 (전진+회전이 이 정책이
+            # 가장 잘하는 동작이다). 게걸음·face_target 은 여기서 안 쓴다.
+            # 경유점이 등 뒤면 먼저 제자리에서 돈다.
+            vy = 0.0
+            vx = 0.0 if abs(go_b) > 90.0 or self._front_blocked() else self.WP_VX
+            ang = self._wp_turn(go_b, vx)
+        elif blocked or res["distance_m"] < self.FOLLOW_STOP_M:
             vx = vy = 0.0                 # 막혔거나 다 왔으면 선다
         elif not sidestep:
             # 옛 방식: 많이 틀어져 있으면 전진 없이 제자리 선회
@@ -987,7 +1133,8 @@ class MjInfer(MJInferBase):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-o", "--onnx_model_path", type=str, required=True)
+    parser.add_argument("-o", "--onnx_model_path", type=str, default=None,
+                        help="안 주면 기본 정책(DEFAULT_POLICY)을 학습 조건째로 쓴다")
     # parser.add_argument("-k", action="store_true", default=False)
     parser.add_argument(
         "--reference_data",
@@ -1010,6 +1157,8 @@ if __name__ == "__main__":
         default=False,
         help="레퍼런스 정합 명령 범위를 쓴다 (fast / rough 정책용)",
     )
+    parser.add_argument("--lin_vel_y", type=float, default=None,
+                        help="게걸음 범위만 덮어쓴다. hp0dy2 정책은 --ref_range --lin_vel_y 0.2")
     parser.add_argument("--start", type=float, nargs=2, default=None,
                         help="출발점 x y")
     parser.add_argument("--start_yaw", type=str, default=None,
@@ -1034,6 +1183,11 @@ if __name__ == "__main__":
                              "굴리면 걸음이 딴판이 된다 (fr186 은 3.23 에서 왼쪽으로 원을 그린다)")
 
     args = parser.parse_args()
+    (args.onnx_model_path, args.ref_range, args.lin_vel_y,
+     args.forcerange) = resolve_policy(args.onnx_model_path, args.ref_range,
+                                       args.lin_vel_y, args.forcerange)
+    print(">>> 정책 {}  (ref_range={}, dy ±{})".format(
+        os.path.basename(args.onnx_model_path), args.ref_range, args.lin_vel_y))
 
     mjinfer = MjInfer(
         args.model_path,
@@ -1041,6 +1195,7 @@ if __name__ == "__main__":
         args.onnx_model_path,
         args.standing,
         args.ref_range,
+        args.lin_vel_y,
     )
     if args.forcerange is not None:
         mjinfer.model.actuator_forcerange[:] = np.array(
