@@ -15,13 +15,17 @@
 #
 # Modified 2026 (Open Duck Mini v2 term project):
 #   - register the previously-unused `cost_head_pos` reward so head commands
-#     are actually tracked (head_pos=-1.0, tracking ignore_head=True)
+#     are actually tracked (weight from HEAD_POS_W, tracking ignore_head=True)
 #   - retune command ranges to match the reference motion's real coverage
 #     (lin_vel_x/lin_vel_y), removing the tracking-vs-imitation conflict
+#   - environment overrides for sweeps, all defaulting to the previous values:
+#     ALIVE_W, HEAD_POS_W, HEAD_ACTION_SCALE, LIN_VEL_X, LIN_VEL_Y,
+#     CMD_AXIS_ZERO (zero each command axis independently with this probability)
 # ==============================================================================
 """Joystick task for Open Duck Mini V2. (based on Berkeley Humanoid)"""
 
 from typing import Any, Dict, Optional, Union
+import os
 import jax
 import jax.numpy as jp
 from ml_collections import config_dict
@@ -88,12 +92,13 @@ def default_config() -> config_dict.ConfigDict:
                 torques=-1.0e-3,
                 action_rate=-0.5,  # was -1.5
                 stand_still=-0.2,  # was -1.0 TODO try to relax this a bit ?
-                alive=20.0,
+                alive=float(os.environ.get("ALIVE_W", "20.0")),
                 imitation=1.0,
                 # 머리 4축(neck_pitch, head_pitch, head_yaw, head_roll)이 명령을 따라가게 한다.
                 # 원본에는 cost_head_pos 가 정의만 되어 있고 등록되지 않아, 정책이 머리 명령을
                 # 완전히 무시하고 home 자세로 굳어 있었다.
-                head_pos=-1.0,
+                # 가중치는 HEAD_POS_W 로 덮어쓴다. 안 주면 기존 -1.0.
+                head_pos=float(os.environ.get("HEAD_POS_W", "-1.0")),
             ),
             tracking_sigma=0.01,  # was working at 0.01
         ),
@@ -109,9 +114,23 @@ def default_config() -> config_dict.ConfigDict:
         # vel_to_index 가 clip 해버린다 → 0.111~0.2 구간 전체가 같은 레퍼런스로 간다.
         # 그 구간에서 tracking_lin_vel("0.2로 가") 과 imitation("0.111 걸음처럼 생겨라")
         # 이 정면충돌한다. 범위를 맞춰서 둘을 같은 편으로 만든다.
-        lin_vel_x=[-0.148, 0.222],
-        lin_vel_y=[-0.111, 0.111],
+        # 전진 범위는 LIN_VEL_X 로 덮어쓴다 (주면 ±값, 안 주면 정합값 = 기존 잡과 동일).
+        # 최대 0.222 로 학습한 정책은 전부 뒤로 못 걷는다 — 같은 날·같은 토크에서 이
+        # 범위만 다른 910949(원본 ±0.15)는 -0.148 명령에 7.1 cm/s 로 물러나고 910953 은
+        # 0.1 cm/s 다 (2026-09-29, SIM_NOTES). 후진은 회피에서 벽에 붙었을 때의 퇴로다.
+        lin_vel_x=([-float(os.environ["LIN_VEL_X"]), float(os.environ["LIN_VEL_X"])]
+                   if "LIN_VEL_X" in os.environ else [-0.148, 0.222]),
+        # 게걸음 범위는 LIN_VEL_Y 로 덮어쓴다 (안 주면 0.111, 기존 잡과 동일).
+        # 0.111 로 맞춘 뒤 제자리 게걸음이 사라졌다 (2026-09-22 측정, SIM_NOTES).
+        lin_vel_y=[-float(os.environ.get("LIN_VEL_Y", "0.111")),
+                   float(os.environ.get("LIN_VEL_Y", "0.111"))],
         ang_vel_yaw=[-1.0, 1.0],  # 레퍼런스는 ±1.111~1.222 라 여유 있음
+        # 전진·게걸음·회전 명령을 축마다 따로 이 확률로 0 으로 만든다 (CMD_AXIS_ZERO).
+        # 상자에서 균일하게 뽑으면 "제자리 게걸음"·"그냥 후진" 같은 한 축짜리 명령이
+        # 거의 안 나온다 (|다른 두 축| 이 작은 경우가 1% 미만). 그런데 회피가 쓰는 건
+        # 바로 그 동작들이고, 기본 정책(hp0dy2)은 후진·제자리 게걸음에서 멈춰 선다.
+        # 0 이면 기존 잡과 난수열까지 같다.
+        cmd_axis_zero=float(os.environ.get("CMD_AXIS_ZERO", "0.0")),
         neck_pitch_range=[-0.34, 1.1],
         head_pitch_range=[-0.78, 0.78],
         head_yaw_range=[-1.5, 1.5],
@@ -142,6 +161,22 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         self._default_actuator = self._mj_model.keyframe(
             "home"
         ).ctrl  # ctrl of all the actual joints (no floating base and no backlash)
+
+        # 관절별 action_scale. 머리 4축(인덱스 5:9)만 HEAD_ACTION_SCALE 로 따로 준다.
+        # 배경: motor_target = default + action * action_scale 이고 action 은 tanh 라 (-1,1) 이다.
+        # 즉 action_scale=0.25 면 머리 목표각이 +-0.25 rad 을 절대 못 넘는다. 실측 스윙이
+        # head_pos 가중치와 alive 를 어떻게 바꿔도 0.48~0.49(=2x0.245)에서 멈춘 이유가 이것이다.
+        # 안 주면 기존 값 그대로라 다른 잡들과 동작이 같다.
+        _as = float(self._config.action_scale)
+        _head_as = float(os.environ.get("HEAD_ACTION_SCALE", _as))
+        _scale_vec = np.full(self._mj_model.nu, _as, dtype=np.float32)
+        _scale_vec[5:9] = _head_as
+        self._action_scale_vec = jp.array(_scale_vec)
+        print("[joystick] action_scale: legs %.3f / head %.3f" % (_as, _head_as))
+        print("[joystick] lin_vel_x %s / lin_vel_y %s / head_pos_w %s / cmd_axis_zero %s"
+              % (list(self._config.lin_vel_x), list(self._config.lin_vel_y),
+                 self._config.reward_config.scales.head_pos,
+                 self._config.cmd_axis_zero))
 
         if USE_IMITATION_REWARD:
             self.PRM = PolyReferenceMotion(
@@ -420,7 +455,7 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         ####
 
         motor_targets = (
-            self._default_actuator + action_w_delay * self._config.action_scale
+            self._default_actuator + action_w_delay * self._action_scale_vec
         )
 
         if USE_MOTOR_SPEED_LIMITS:
@@ -730,6 +765,16 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             minval=self._config.head_roll_range[0] * self._config.head_range_factor,
             maxval=self._config.head_roll_range[1] * self._config.head_range_factor,
         )
+
+        if self._config.cmd_axis_zero > 0.0:
+            # 키는 rng4 에서 접어 만든다. split 개수를 바꾸면 나머지 명령의 난수까지
+            # 전부 바뀌어서, 이 값을 안 준 잡과 비교할 때 변수가 하나가 아니게 된다.
+            keep = jax.random.bernoulli(
+                jax.random.fold_in(rng4, 1), 1.0 - self._config.cmd_axis_zero, (3,)
+            )
+            lin_vel_x, lin_vel_y, ang_vel_yaw = jp.where(
+                keep, jp.hstack([lin_vel_x, lin_vel_y, ang_vel_yaw]), 0.0
+            )
 
         # With 10% chance, set everything to zero.
         return jp.where(
