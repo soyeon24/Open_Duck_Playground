@@ -31,6 +31,12 @@ DEFAULT_POLICY = dict(
 )
 
 
+# 물러날 때만 잠깐 쓰는 정책 (MjInfer.backoff). 기본 정책은 후진 명령에 0 cm 다.
+# 08-31 은 실물 토크(1.86)에서 12초에 −76 cm 물러난다 — 가진 정책 중 가장 많이 (SIM_NOTES 09-29).
+DEFAULT_BACKOFF_POLICY = os.path.join(_PROJECT_ROOT, "from_ubai",
+                                      "2026_08_31_144425_300482560.onnx")
+
+
 def resolve_policy(onnx=None, ref_range=False, lin_vel_y=None, forcerange=None):
     """정책 파일을 안 주면 기본 정책을 **학습 조건째로** 돌려준다. 주면 받은 그대로.
 
@@ -215,6 +221,30 @@ class MjInfer(MJInferBase):
         # 문턱이 높다. 0.8 이면 두 정책 다 25~29°/s 로, 한 바퀴에 13초다.
         self.FOLLOW_SEARCH = 0.8
 
+        # 사람이 너무 가까우면 물러난다. 기본 정책(hp0dy2)은 후진 명령에 0 cm 라,
+        # 물러나는 동안만 후진이 되는 정책(DEFAULT_BACKOFF_POLICY, 08-31)으로 바꿔 쓴다.
+        # 두 정책은 관측·행동 구조가 같다. 서 있을 때·전진 중·후진 도중에 바꿔 끼워도
+        # 안 넘어졌다 (2026-09-29, 각 3판, 최저 up 0.991, 4초에 21~23 cm 후진).
+        # 이게 없을 때는 사람이 다가와 25 cm 앞에 서면 그대로 서 있다가 밴드가 화각
+        # 아래로 빠져 놓친 채 끝났다 (eval_follow_moving "다가오기" 0/3).
+        self.backoff = True
+        # 보이는 사람이 이보다 가까우면 물러나기 시작 (카메라 기준). 멈추는 건 FOLLOW_STOP_M
+        # (0.55) 밖에서 다시 보일 때다. 사이를 둬서 떨지 않게 한다.
+        # ⚠ 밴드는 카메라 0.46 m 에서 이미 화각 아래로 빠진다 (09-29 실측, 노트의 0.4 m 보다
+        # 멀다). 처음에 0.45 로 뒀더니 보이는 동안 한 번도 안 걸려서 물러나기가 안 켜졌다.
+        # 그래서 **놓쳤을 때**는 마지막으로 본 거리가 FOLLOW_STOP_M 안이면 물러난다 —
+        # 멈출 거리 안에서 사라졌다면 가까이 와서 화각 아래로 빠진 것이다.
+        self.BACKOFF_M = 0.50
+        self.BACKOFF_VX = -0.15         # 08-31 이 학습한 후진 상한
+        # 가까이서 놓친 뒤(밴드가 화각 아래로) 계속 물러날 시간. 3초로는 모자랐다 — 사람이
+        # 계속 다가오는 동안 내내 안 보이고(0.1 m/s 면 7초 가까이), 멈춘 뒤에도 다시 보일
+        # 거리(몸통 0.56 m)까지 5~6초를 더 물러나야 한다 (후진 약 5.5 cm/s).
+        self.BACKOFF_LOST_S = 12.0
+        self.backoff_onnx = DEFAULT_BACKOFF_POLICY
+        self.back_policy = None         # 처음 물러날 때 읽는다
+        self.backing = False
+        self.backing_lost = 0           # 물러나는 중에 연달아 놓친 제어스텝
+
         # 장애물 회피 (V 키). 바닥 채도로 빈 곳을 찾아 표적 쪽에 가장 가까운
         # 빈 방향으로 간다. 이것도 정책 밖 층이라 재학습이 없다.
         self.avoid = True
@@ -395,6 +425,8 @@ class MjInfer(MJInferBase):
         self.detour_wp = None
         self.plan_path = None
         self.person_xy = None
+        self.backing = False
+        self.backing_lost = 0
         mujoco.mj_forward(self.model, self.data)
 
         self.last_action = np.zeros(self.num_dofs)
@@ -553,6 +585,7 @@ class MjInfer(MJInferBase):
         if keycode == 70:  # f : 사람 자동 추종 on/off
             self.follow = not self.follow
             self.follow_lost = 0
+            self.backing = False
             self.avoid_side = 0
             self.obs_mem = None
             self.target_world_deg = None
@@ -814,6 +847,42 @@ class MjInfer(MJInferBase):
         return bool(np.any((fwd > 0.0) & (fwd < self.WP_GUARD_M)
                            & (np.abs(lat) < self.WP_GUARD_HALF_W)))
 
+    def _rear_blocked(self):
+        """기억된 장애물이 몸통 바로 뒤에 있는가. 카메라는 앞만 보므로 뒤는 기억뿐이다."""
+        if self.obs_mem is None or len(self.obs_mem.pts) == 0:
+            return False
+        base = self.get_floating_base_qpos(self.data.qpos)
+        a = np.radians(self.body_yaw_deg())
+        rel = self.obs_mem.pts - base[:2]
+        fwd = rel[:, 0] * np.cos(a) + rel[:, 1] * np.sin(a)
+        lat = -rel[:, 0] * np.sin(a) + rel[:, 1] * np.cos(a)
+        return bool(np.any((fwd < 0.0) & (fwd > -self.WP_GUARD_M)
+                           & (np.abs(lat) < self.WP_GUARD_HALF_W)))
+
+    def _back_off(self, target_b):
+        """물러난다. target_b 는 몸통 기준 사람 방위(도), 안 보이면 None.
+
+        True 를 돌려주면 이번 스텝 명령을 채운 것이다. 후진 정책을 못 읽으면 물러나기를
+        끄고 False — 호출한 쪽이 예전처럼 선다.
+        """
+        if self.back_policy is None:
+            if not os.path.exists(self.backoff_onnx):
+                print(f">>> 물러나기 정책이 없다 ({self.backoff_onnx}). 물러나기 끔")
+                self.backoff = self.backing = False
+                return False
+            self.back_policy = OnnxInfer(self.backoff_onnx, awd=True)
+            print(f">>> 물러나기 정책 읽음: {os.path.basename(self.backoff_onnx)}")
+        self.commands[0] = 0.0 if self._rear_blocked() else self.BACKOFF_VX
+        self.commands[1] = 0.0
+        # 보이면 사람을 정면에 둔 채 물러난다. 안 보이면 기억한 월드 방위 쪽으로 튼다 —
+        # 가까이서 옆으로 빠진 사람도 다시 화각에 들어오게.
+        if target_b is None and self.target_world_deg is not None:
+            target_b = (self.target_world_deg - self.body_yaw_deg() + 180.0) % 360.0 - 180.0
+        self.commands[2] = (0.0 if target_b is None else float(np.clip(
+            self.FOLLOW_KP * target_b,
+            self.COMMANDS_RANGE_THETA[0], self.COMMANDS_RANGE_THETA[1])))
+        return True
+
     def _person_xy(self, res, img):
         """밴드 검출 결과 -> 사람(발목)의 월드 xy. 실기에서는 카메라 자세를 IMU·관절각으로."""
         band_tracker = _band_tracker()
@@ -879,6 +948,15 @@ class MjInfer(MJInferBase):
             # 놓치기 직전의 부호를 쓰는 게 핵심이다 — 고정 방향으로 훑으면
             # 표적이 오른쪽으로 사라졌는데 왼쪽으로 도는 일이 생긴다.
             self.follow_lost += 1
+            if self.backoff and (self.backing or self.follow_dist < self.FOLLOW_STOP_M):
+                # 가까이서 놓쳤다 = 밴드가 화각 아래로 빠졌다 (카메라 0.46 m 안). 물러나던
+                # 중이었거나 마지막으로 본 거리가 멈출 거리 안이면 정해 둔 시간은 계속 물러난다.
+                self.backing_lost += 1
+                if self.backing_lost * self.sim_dt * self.decimation <= self.BACKOFF_LOST_S:
+                    self.backing = True
+                    if self._back_off(None):
+                        return
+                self.backing = False
             # 우회 중이면 경유점까지는 간다. 경유점은 월드 좌표라 사람이 안 보여도
             # 유효하다. 우회하느라 몸을 틀면 사람이 화각 밖으로 빠지기 쉬운데, 그때마다
             # 서서 사람 쪽으로 돌아버리면 우회가 영영 안 끝난다. 닿으면 놓고 찾는다.
@@ -932,6 +1010,23 @@ class MjInfer(MJInferBase):
         target_b = res["bearing_deg"] + head_yaw
         self.target_world_deg = body_yaw + target_b   # 안 보일 때 쓸 기억
         go_b, blocked = target_b, False
+
+        # ── 너무 가까우면 물러난다 ────────────────────────────────────────
+        # BACKOFF_M 안이면 시작, FOLLOW_STOP_M 밖에서 보이면 멈춘다 (사이를 둬서 안 떤다).
+        # 물러나는 동안은 회피·전진 계산을 건너뛴다 — 뒤는 기억으로만 막힘을 본다.
+        self.backing_lost = 0
+        if self.backoff:
+            if dist < self.BACKOFF_M:
+                self.backing = True
+            elif self.backing and dist >= self.FOLLOW_STOP_M:
+                self.backing = False
+            if self.backing:
+                if self.head_track:
+                    self.direct_head = True
+                    self.commands[5] = float(np.radians(np.clip(
+                        target_b, -self.HEAD_TRACK_MAX_DEG, self.HEAD_TRACK_MAX_DEG)))
+                if self._back_off(target_b):
+                    return
 
         if self.avoid:
             import floor_scan
@@ -1094,7 +1189,10 @@ class MjInfer(MJInferBase):
             self.commands,
         )
         self.saved_obs.append(obs)
-        action = self.policy.infer(obs)
+        # 물러나는 동안만 후진이 되는 정책으로 추론한다 (backoff). 나머지는 기본 정책.
+        policy = (self.back_policy if self.backing and self.back_policy is not None
+                  else self.policy)
+        action = policy.infer(obs)
 
         # self.action_filter.push(action)
         # action = self.action_filter.get_filtered_action()
