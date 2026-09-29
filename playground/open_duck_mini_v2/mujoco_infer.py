@@ -246,6 +246,18 @@ class MjInfer(MJInferBase):
         # 끄면 예전 모서리 방식(detour_waypoint)으로 돌아간다.
         self.path_plan = True
         self.plan_path = None             # 마지막으로 찾은 경로 (표시·채점용)
+        # 따라가는 사람의 발은 장애물로 기억하지 않는다. 걸어간 사람의 발자국이 장애물로
+        # 남아 빈 바닥에서 우회하다 사람을 놓쳤다 — 걷는 사람 따라가기 회피 켬 2/15,
+        # 끔 6/15 (2026-09-29, eval_follow_moving). 기억은 "보이는데 비었을 때" 만 지우는데
+        # 뒤따라가는 거리(0.55~0.7 m)에서는 사각(0.54 m)과 사람 발 사이에 지울 틈이 없다.
+        # 밴드가 가리키는 바닥 위치 둘레 TARGET_IGNORE_R_M 안은 넣지 않고, 있던 점도 지운다.
+        # 끄면 예전처럼 사람 발도 기억한다.
+        self.target_not_obstacle = True
+        self.TARGET_IGNORE_R_M = 0.30
+        # 밴드 무게중심의 화면 높이로 낸 사람(발목) 월드 위치 (band_tracker.ground_xy).
+        # 밴드 폭으로 낸 거리(`follow_dist`)는 옆에서 보면 2배 넘게 부풀지만 이건 0.12 m
+        # 안이다 (09-29 실측, 참 0.72 m 를 폭은 1.74, 높이는 0.59). 안 보이면 None.
+        self.person_xy = None
         # 경유점으로 갈 때의 명령. 기본 정책 실측 (2026-09-28, 정격 1.86):
         #   전진 0.07 은 회전을 얼마를 얹든 거의 제자리 — **0.1 미만은 사각지대**다.
         #   전진 0.15 는 회전을 얹어도 12 cm/s 를 유지하고, 회전 0.5 -> 31°/s,
@@ -382,6 +394,7 @@ class MjInfer(MJInferBase):
         self.obs_mem = None               # 이전 판에서 본 장애물은 잊는다
         self.detour_wp = None
         self.plan_path = None
+        self.person_xy = None
         mujoco.mj_forward(self.model, self.data)
 
         self.last_action = np.zeros(self.num_dofs)
@@ -702,8 +715,9 @@ class MjInfer(MJInferBase):
                 img, float(self.model.cam_fovy[self.follow_cam_id]))
             self.scan_steps += 1
             # 도는 동안 장애물도 훑어 둔다. 출발 전에 주변 지도를 채우는 셈이다.
+            # 사람이 화면에 들어왔으면 그 발은 빼고 넣는다.
             if self.avoid and self.obs_memory:
-                self.see_obstacles(img)
+                self.see_obstacles(img, None if res is None else self._person_xy(res, img))
             if res is None:
                 self.goto_seen = 0
             else:
@@ -744,6 +758,8 @@ class MjInfer(MJInferBase):
         #
         # 도착점 좌표를 알면 그걸로 선다. 방향은 눈으로 잡고, 정지는 좌표로
         # 한다 — 각자 잘하는 것만 시킨다.
+        # (2026-09-29 부터 `follow_dist` 는 밴드 폭이 아니라 밴드 높이로 낸 위치에서 잰다.
+        #  옆에서 봐도 0.12 m 안이라 위의 부풀림은 폭 거리로 되돌아갈 때만 해당된다.)
         # 둘 중 **먼저 닿는 쪽**으로 선다. 하나만 보면 둘 다 막힌다:
         #   카메라만  -> 밴드가 화각 아래로 빠지면 영영 0.55 에 안 닿아 지나친다.
         #   좌표만    -> 카메라가 먼저 "다 왔다"며 다리를 세워 버리는데
@@ -798,13 +814,22 @@ class MjInfer(MJInferBase):
         return bool(np.any((fwd > 0.0) & (fwd < self.WP_GUARD_M)
                            & (np.abs(lat) < self.WP_GUARD_HALF_W)))
 
-    def see_obstacles(self, img):
+    def _person_xy(self, res, img):
+        """밴드 검출 결과 -> 사람(발목)의 월드 xy. 실기에서는 카메라 자세를 IMU·관절각으로."""
+        band_tracker = _band_tracker()
+        cid = self.follow_cam_id
+        return band_tracker.ground_xy(
+            res, img.shape, float(self.model.cam_fovy[cid]),
+            self.data.cam_xpos[cid], self.data.cam_xmat[cid].reshape(3, 3))
+
+    def see_obstacles(self, img, person_xy=None):
         """머리 카메라 한 장으로 바닥 여유거리를 재고, 켜져 있으면 장애물 기억에 넣는다.
 
         반환: (방위[몸통 프레임, 도], 여유거리[m], 최소 가시거리[m]). 여유거리는
         기억을 합친 값이다. 추종(follow_step)과 사람 찾기 선회(goto_step 의 scan)가
         같이 쓴다 — 선회하는 동안 사방을 한 번 훑으므로 그때 기억을 채워 두면,
         걷다가 몸을 틀어 화면 밖으로 나간 장애물도 이미 알고 있다.
+        person_xy 를 주면 그 둘레는 기억에 넣지 않는다 (target_not_obstacle).
         """
         import floor_scan
         R = self.data.cam_xmat[self.follow_cam_id].reshape(3, 3)
@@ -827,7 +852,9 @@ class MjInfer(MJInferBase):
             # 실기에서 카메라 위치는 오도메트리로 얻는다.
             free = self.obs_mem.update(
                 self.data.cam_xpos[self.follow_cam_id][:2], self.body_yaw_deg(),
-                bearings, free, blind)
+                bearings, free, blind,
+                ignore_xy=person_xy if self.target_not_obstacle else None,
+                ignore_r_m=self.TARGET_IGNORE_R_M)
         return bearings, free, blind
 
     def follow_step(self, img=None):
@@ -842,6 +869,7 @@ class MjInfer(MJInferBase):
             if img is None:
                 return
         res = band_tracker.track(img, float(self.model.cam_fovy[self.follow_cam_id]))
+        self.person_xy = None if res is None else self._person_xy(res, img)
 
         body_yaw = self.body_yaw_deg()
 
@@ -883,7 +911,15 @@ class MjInfer(MJInferBase):
                 self.commands[2] = self.FOLLOW_SEARCH * self.follow_last_sign
             return
         self.follow_lost = 0
-        self.follow_dist = float(res["distance_m"])
+        # 거리는 밴드 높이로 낸 위치에서 잰다 (카메라 바닥 투영에서 수평거리). 밴드 폭으로
+        # 낸 `distance_m` 은 옆에서 보면 두 발목이 겹쳐 2배 넘게 부풀어, 옆에서 멈춘 사람에게
+        # 0.55 m 에서 서지 않고 0.34~0.39 m 까지 파고들었다 — 그러면 밴드가 화각 아래로
+        # 빠져 놓친 채 끝난다 (2026-09-29, eval_follow_moving). 위치를 못 구할 때만 폭 거리.
+        dist = float(res["distance_m"])
+        if self.person_xy is not None:
+            dist = float(np.hypot(*(np.asarray(self.person_xy)
+                                    - self.data.cam_xpos[self.follow_cam_id][:2])))
+        self.follow_dist = dist
         self.follow_last_sign = 1.0 if res["bearing_deg"] >= 0 else -1.0
 
         # ── 좌표계 ────────────────────────────────────────────────────────
@@ -899,22 +935,25 @@ class MjInfer(MJInferBase):
 
         if self.avoid:
             import floor_scan
-            bearings, free, blind = self.see_obstacles(img)
+            bearings, free, blind = self.see_obstacles(img, self.person_xy)
 
             # 어차피 갈 표적을 장애물로 보고 피하면 영영 못 간다. 표적보다 가까운
             # 것만 장애물로 친다. 동시에 최소 가시거리보다는 넉넉해야 한다 —
             # 그 안쪽은 카메라가 못 보므로 거기 닿기 전에 결정해야 한다.
-            clearance = min(res["distance_m"] - self.AVOID_TARGET_MARGIN,
-                            self.AVOID_LOOKAHEAD)
+            clearance = min(dist - self.AVOID_TARGET_MARGIN, self.AVOID_LOOKAHEAD)
             clearance = max(clearance, blind + self.AVOID_BLIND_MARGIN)
             if self.waypoint_detour and self.obs_mem is not None:
                 # 표적 위치: 자율 이동이면 도착점 좌표, 추종이면 카메라 추정.
+                # 카메라 추정은 밴드 높이로 낸 위치를 먼저 쓴다. 밴드 폭으로 낸 거리는
+                # 옆에서 보면 2배 넘게 부풀어, A* 의 도착 영역이 사람 너머에 찍혔다.
                 base = self.get_floating_base_qpos(self.data.qpos)
                 if self.goto and self.goal is not None:
                     tgt = np.array(self.goal, dtype=float)
+                elif self.person_xy is not None:
+                    tgt = np.array(self.person_xy, dtype=float)
                 else:
                     a = np.radians(self.target_world_deg)
-                    tgt = base[:2] + res["distance_m"] * np.array([np.cos(a), np.sin(a)])
+                    tgt = base[:2] + dist * np.array([np.cos(a), np.sin(a)])
                 self._plan_detour(base[:2], tgt)
                 if self.detour_wp is not None:
                     dx, dy = self.detour_wp - base[:2]
@@ -987,7 +1026,7 @@ class MjInfer(MJInferBase):
             vy = 0.0
             vx = 0.0 if abs(go_b) > 90.0 or self._front_blocked() else self.WP_VX
             ang = self._wp_turn(go_b, vx)
-        elif blocked or res["distance_m"] < self.FOLLOW_STOP_M:
+        elif blocked or dist < self.FOLLOW_STOP_M:
             vx = vy = 0.0                 # 막혔거나 다 왔으면 선다
         elif not sidestep:
             # 옛 방식: 많이 틀어져 있으면 전진 없이 제자리 선회
