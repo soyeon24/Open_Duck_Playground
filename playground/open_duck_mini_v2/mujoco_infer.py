@@ -240,6 +240,12 @@ class MjInfer(MJInferBase):
         # 경유점은 기억(obs_memory)을 쓰므로 기억이 켜져 있어야 동작한다.
         self.waypoint_detour = True
         self.detour_wp = None             # 지금 향하는 경유점 (표시·채점용)
+        # 경유점을 모서리 하나로 고르지 않고 A* 경로 위에서 고른다 (floor_scan.plan_detour).
+        # 모서리 방식은 벽을 돌자마자 턱·기둥에 막혀 다시 판단하다가, 벽–턱 사이
+        # 22 cm 틈(몸통 24 cm)에 경유점을 찍고 20초를 서 있었다 (2026-09-28).
+        # 끄면 예전 모서리 방식(detour_waypoint)으로 돌아간다.
+        self.path_plan = True
+        self.plan_path = None             # 마지막으로 찾은 경로 (표시·채점용)
         # 경유점으로 갈 때의 명령. 기본 정책 실측 (2026-09-28, 정격 1.86):
         #   전진 0.07 은 회전을 얼마를 얹든 거의 제자리 — **0.1 미만은 사각지대**다.
         #   전진 0.15 는 회전을 얹어도 12 cm/s 를 유지하고, 회전 0.5 -> 31°/s,
@@ -375,6 +381,7 @@ class MjInfer(MJInferBase):
         self.data.ctrl[:] = self.default_actuator
         self.obs_mem = None               # 이전 판에서 본 장애물은 잊는다
         self.detour_wp = None
+        self.plan_path = None
         mujoco.mj_forward(self.model, self.data)
 
         self.last_action = np.zeros(self.num_dofs)
@@ -767,6 +774,18 @@ class MjInfer(MJInferBase):
             ang = 0.8 if bearing_deg >= 0 else -0.8
         return ang
 
+    def _plan_detour(self, robot_xy, tgt):
+        """경유점(detour_wp)을 새로 잡는다. None 이면 표적까지 직선이 비었다."""
+        import floor_scan
+        if self.path_plan:
+            self.detour_wp, self.plan_path, blocked = floor_scan.plan_detour(
+                self.obs_mem.pts, robot_xy, tgt)
+            if self.detour_wp is not None or not blocked:
+                return
+            # 막혔는데 격자로는 길이 없다 (번진 기억이 틈을 메웠을 때). 모서리 방식으로.
+        self.detour_wp, self.avoid_side = floor_scan.detour_waypoint(
+            self.obs_mem.pts, robot_xy, tgt, side=self.avoid_side)
+
     def _front_blocked(self):
         """기억된 장애물이 몸통 바로 앞(WP_GUARD_M 안, 좌우 반폭 안)에 있는가."""
         if self.obs_mem is None or len(self.obs_mem.pts) == 0:
@@ -835,6 +854,12 @@ class MjInfer(MJInferBase):
             # 우회 중이면 경유점까지는 간다. 경유점은 월드 좌표라 사람이 안 보여도
             # 유효하다. 우회하느라 몸을 틀면 사람이 화각 밖으로 빠지기 쉬운데, 그때마다
             # 서서 사람 쪽으로 돌아버리면 우회가 영영 안 끝난다. 닿으면 놓고 찾는다.
+            if (self.avoid and self.path_plan and self.goto and self.goal is not None
+                    and self.obs_mem is not None and self.detour_wp is not None):
+                # 도착점 좌표를 알면 사람이 안 보여도 경로는 다시 풀 수 있다. 옛 점을
+                # 끝까지 쫓으면 그 사이 새로 본 장애물을 무시하게 된다.
+                base = self.get_floating_base_qpos(self.data.qpos)
+                self._plan_detour(base[:2], np.array(self.goal, dtype=float))
             if self.avoid and self.detour_wp is not None:
                 base = self.get_floating_base_qpos(self.data.qpos)
                 dx, dy = self.detour_wp - base[:2]
@@ -890,8 +915,7 @@ class MjInfer(MJInferBase):
                 else:
                     a = np.radians(self.target_world_deg)
                     tgt = base[:2] + res["distance_m"] * np.array([np.cos(a), np.sin(a)])
-                self.detour_wp, self.avoid_side = floor_scan.detour_waypoint(
-                    self.obs_mem.pts, base[:2], tgt, side=self.avoid_side)
+                self._plan_detour(base[:2], tgt)
                 if self.detour_wp is not None:
                     dx, dy = self.detour_wp - base[:2]
                     go_b = (np.degrees(np.arctan2(dy, dx)) - body_yaw + 180.0) % 360.0 - 180.0
