@@ -202,7 +202,14 @@ class MjInfer(MJInferBase):
         self.follow_rend = None
         self.follow_cam_id = None
         self.follow_lost = 0
-        self.follow_last_sign = 1.0   # 놓치기 직전 표적이 있던 쪽 (+1 왼쪽)
+        self.follow_last_sign = 1.0   # 놓치면 훑을 쪽 (+1 왼쪽)
+        # 훑을 쪽은 사람이 **움직이던 쪽**으로 고른다. 화면 어느 쪽에 있었는지(방위 부호)로
+        # 고르면, 상자 뒤로 걸어 들어간 사람이 화면 가운데 조금 오른쪽에서 사라졌다고 오른쪽으로
+        # 250° 를 돌았다 — 사람은 왼쪽으로 가고 있었다 (2026-09-30, 소파 씬). 보이는 동안의
+        # 월드 방위를 들고 있다가 놓치는 순간 기울기를 본다. 거의 안 움직였으면 방위 부호.
+        self.seen_world_deg = []          # 최근 SEEN_HIST_N 제어스텝의 월드 방위
+        self.SEEN_HIST_N = 50             # 1초. 0.1 m/s 면 10 cm 라 위치 잡음보다 커야 한다
+        self.MOVE_SIGN_DEG_S = 3.0        # 이보다 느리게 돌면 움직임으로 안 친다
         # 도당 요 명령. eval_follow.py 로 재본 값 (사람 2.4,+0.9 / 20초):
         #   0.012 -> 방위 32.1° 로 벌어진다. 못 따라간다
         #   0.020 -> 방위 11.1°  ← 이걸 쓴다
@@ -339,6 +346,35 @@ class MjInfer(MJInferBase):
         # 실기에서는 자이로 z 적분이라 드리프트가 쌓이지만, 표적을 다시 잡을
         # 때까지 몇 초만 버티면 되는 용도라 충분하다.
         self.target_world_deg = None
+        # 방위만 기억하면 모자랐다. 벽 너머를 가로지르는 사람을 쫓다 놓치자, 오리는 기억한
+        # 방위로 돌아서 섰고 사람은 그 사이 더 걸어가 영영 못 찾았다 (2026-09-30,
+        # eval_follow_moving --scene wall). 그래서 놓치면 **마지막으로 본 월드 위치**까지
+        # 걸어간다 (회피가 켜져 있으면 A* 로). 거기서도 안 보이면 사라진 쪽으로 훑는다.
+        # 실기에서 위치는 오도메트리 기준이라 몇 초 동안만 믿을 만하다 — 그래서 시간을 묶는다.
+        #
+        # 다만 사라진 자리 그 자체가 아니라 **그 사람이 가던 대로 계속 갔을 자리**를 쫓는다
+        # (사라진 자리 + 속도 × 놓친 시간, CHASE_PREDICT_M 까지). 소파 씬에서 잰 것 (2026-09-30):
+        #   사라진 자리로      숨기 2/3 · 돌아 나오기 1/3 (그 모서리에서는 소파가 반대편을 가린다)
+        #   가던 대로 간 자리  숨기 1/3 · 돌아 나오기 3/3  <- 이것. 벽 씬도 6/9 -> 7/9
+        #   둘을 차례로        2/6 (두 구간을 걷는 사이 사람이 이미 반대편으로 나가 있다)
+        # 남은 약점: 숨자마자 선 사람은 1 m 지나쳐 간다 (숨기 0.2 · 0.3 m/s).
+        self.chase_last_seen = True
+        self.last_seen_xy = None          # 마지막으로 본 사람(발목) 월드 xy
+        self.seen_xy = []                 # 최근 SEEN_HIST_N 제어스텝의 사람 위치 (속도용)
+        self.lost_v = np.zeros(2)         # 놓치는 순간의 사람 속도 [m/s]
+        self.CHASE_PREDICT_M = 1.0        # 가던 길로 이만큼까지만 내다본다
+        self.MOVE_MIN_V = 0.05            # 이보다 느리면 선 것으로 본다 (위치 추정 잡음 3~12 cm)
+        self.chase_steps = 0              # 그 위치로 가는 데 쓴 제어스텝
+        self.CHASE_ARRIVE_M = 0.45        # 몸통이 이만큼 다가가도 안 보이면 사람이 떠난 것
+        self.CHASE_MAX_S = 20.0           # 이보다 오래 가도 못 닿으면 포기하고 훑는다
+        # 갈 곳이 이보다 옆이면 걷지 않고 제자리에서 먼저 돈다. 걸으면서 돌면(전진 0.15 + 회전
+        # 1.0) 호를 그리는 사이 사람이 더 멀어져서, 화각 가장자리로 빠진 사람을 제자리 선회보다
+        # 늦게 다시 잡았다 (빈 바닥 "둘레 반 바퀴" 0.3 m/s 가 7.5초 놓침, 2026-09-30).
+        self.CHASE_ALIGN_DEG = 45.0
+        # 기억한 방위로 돌 때 이만큼 안에 들어왔는데도 안 보이면 방위 기억을 버리고 훑는다.
+        # 전에는 비례 명령이 0.5 아래(제자리 회전 사각지대)로 떨어져 오차 19° 를 남기고
+        # 30초를 서 있었다.
+        self.TURN_DONE_DEG = 8.0
 
         # 게걸음으로 비켜 갈지. 켜면 벽 배치에서 81% 로 나빠진다 (위 표).
         # 회피 방향과 머리 조준이 서로 물려 돌아 표적을 놓치기 때문으로 보인다.
@@ -425,6 +461,10 @@ class MjInfer(MJInferBase):
         self.detour_wp = None
         self.plan_path = None
         self.person_xy = None
+        self.last_seen_xy = None
+        self.seen_world_deg = []
+        self.seen_xy = []
+        self.chase_steps = 0
         self.backing = False
         self.backing_lost = 0
         mujoco.mj_forward(self.model, self.data)
@@ -589,6 +629,9 @@ class MjInfer(MJInferBase):
             self.avoid_side = 0
             self.obs_mem = None
             self.target_world_deg = None
+            self.last_seen_xy = None
+            self.seen_world_deg = []
+            self.seen_xy = []
             if not self.follow:
                 self.commands[0:3] = [0.0, 0.0, 0.0]
                 self.commands[5] = 0.0
@@ -883,6 +926,48 @@ class MjInfer(MJInferBase):
             self.COMMANDS_RANGE_THETA[0], self.COMMANDS_RANGE_THETA[1])))
         return True
 
+    def _chase_step(self, body_yaw, img):
+        """놓친 사람을 마지막으로 본 자리로 간다. True 면 이번 스텝 명령을 채운 것이다.
+
+        닿았거나(CHASE_ARRIVE_M) 너무 오래 걸리면(CHASE_MAX_S) 그 자리를 잊고, 방위 기억도
+        버려서 사라진 쪽(follow_last_sign)으로 훑게 한 뒤 False.
+        """
+        base = self.get_floating_base_qpos(self.data.qpos)
+        self.chase_steps += 1
+        t_lost = self.chase_steps * self.sim_dt * self.decimation
+        # 가던 대로 계속 갔을 자리. CHASE_PREDICT_M 에 닿으면 거기서 멈춘다.
+        step = self.lost_v * t_lost
+        n = float(np.hypot(*step))
+        if n > self.CHASE_PREDICT_M:
+            step = step * (self.CHASE_PREDICT_M / n)
+        tgt = self.last_seen_xy + step
+        far = float(np.hypot(*(tgt - base[:2]))) > self.CHASE_ARRIVE_M
+        if not far or t_lost > self.CHASE_MAX_S:
+            self.last_seen_xy = None
+            self.detour_wp = None
+            self.target_world_deg = None
+            return False
+        if self.avoid and self.obs_memory:
+            self.see_obstacles(img)       # 가는 동안에도 바닥을 봐서 기억을 채운다
+        wp = tgt
+        if self.avoid and self.path_plan and self.obs_mem is not None:
+            self._plan_detour(base[:2], tgt)
+            if self.detour_wp is not None:
+                wp = self.detour_wp
+        wb = (np.degrees(np.arctan2(wp[1] - base[1], wp[0] - base[0])) - body_yaw + 180.0) % 360.0 - 180.0
+        self.commands[0] = (0.0 if abs(wb) > self.CHASE_ALIGN_DEG or self._front_blocked()
+                            else self.WP_VX)
+        self.commands[1] = 0.0
+        self.commands[2] = self._wp_turn(wb, self.commands[0])
+        if self.head_track:
+            # 보일 때와 같게, 머리는 사람이 있던 곳과 갈 방향 사이를 본다.
+            tb = (np.degrees(np.arctan2(tgt[1] - base[1], tgt[0] - base[0])) - body_yaw + 180.0) % 360.0 - 180.0
+            self.direct_head = True
+            self.commands[5] = float(np.radians(np.clip(
+                self.HEAD_AIM_BLEND * tb + (1.0 - self.HEAD_AIM_BLEND) * wb,
+                -self.HEAD_TRACK_MAX_DEG, self.HEAD_TRACK_MAX_DEG)))
+        return True
+
     def _person_xy(self, res, img):
         """밴드 검출 결과 -> 사람(발목)의 월드 xy. 실기에서는 카메라 자세를 IMU·관절각으로."""
         band_tracker = _band_tracker()
@@ -943,6 +1028,21 @@ class MjInfer(MJInferBase):
         body_yaw = self.body_yaw_deg()
 
         if res is None:
+            if self.follow_lost == 0 and len(self.seen_world_deg) >= 5:
+                # 막 놓쳤다. 보이던 동안 사람이 어느 쪽으로 움직였는지로 훑을 쪽을 정한다.
+                w = np.unwrap(np.radians(self.seen_world_deg))
+                rate = np.degrees(w[-1] - w[0]) / ((len(w) - 1) * self.sim_dt * self.decimation)
+                if abs(rate) > self.MOVE_SIGN_DEG_S:
+                    self.follow_last_sign = 1.0 if rate > 0 else -1.0
+            if self.follow_lost == 0:
+                self.lost_v = np.zeros(2)
+                if len(self.seen_xy) >= 10:
+                    v = (self.seen_xy[-1] - self.seen_xy[0]) / (
+                        (len(self.seen_xy) - 1) * self.sim_dt * self.decimation)
+                    if np.hypot(*v) > self.MOVE_MIN_V:
+                        self.lost_v = v
+            self.seen_world_deg = []
+            self.seen_xy = []
             # 놓쳤다. 월드 기준으로 어디 있었는지 기억하고 있으면 그쪽으로 돈다.
             # 기억이 없을 때만 마지막으로 본 쪽으로 훑는다.
             # 놓치기 직전의 부호를 쓰는 게 핵심이다 — 고정 방향으로 훑으면
@@ -957,6 +1057,9 @@ class MjInfer(MJInferBase):
                     if self._back_off(None):
                         return
                 self.backing = False
+            if self.chase_last_seen and not self.goto and self.last_seen_xy is not None:
+                if self._chase_step(body_yaw, img):
+                    return
             # 우회 중이면 경유점까지는 간다. 경유점은 월드 좌표라 사람이 안 보여도
             # 유효하다. 우회하느라 몸을 틀면 사람이 화각 밖으로 빠지기 쉬운데, 그때마다
             # 서서 사람 쪽으로 돌아버리면 우회가 영영 안 끝난다. 닿으면 놓고 찾는다.
@@ -982,13 +1085,20 @@ class MjInfer(MJInferBase):
             if self.target_world_deg is not None:
                 # 기억한 월드 방위를 지금 몸통 기준으로 되돌린다.
                 err = (self.target_world_deg - body_yaw + 180.0) % 360.0 - 180.0
-                self.commands[2] = float(np.clip(
-                    self.FOLLOW_KP * err,
-                    self.COMMANDS_RANGE_THETA[0], self.COMMANDS_RANGE_THETA[1]))
-            else:
-                self.commands[2] = self.FOLLOW_SEARCH * self.follow_last_sign
+                if abs(err) < self.TURN_DONE_DEG:
+                    # 다 돌았는데 안 보인다 — 사람은 그 사이 옮겨 갔다. 사라진 쪽으로 훑는다.
+                    self.target_world_deg = None
+                else:
+                    # 제자리 회전이라 사각지대(0.5 미만)를 건너뛴다.
+                    self.commands[2] = self._wp_turn(err, 0.0)
+                    return
+            self.commands[2] = self.FOLLOW_SEARCH * self.follow_last_sign
             return
         self.follow_lost = 0
+        self.chase_steps = 0
+        if self.person_xy is not None:
+            self.last_seen_xy = np.array(self.person_xy, dtype=float)
+            self.seen_xy = (self.seen_xy + [self.last_seen_xy])[-self.SEEN_HIST_N:]
         # 거리는 밴드 높이로 낸 위치에서 잰다 (카메라 바닥 투영에서 수평거리). 밴드 폭으로
         # 낸 `distance_m` 은 옆에서 보면 두 발목이 겹쳐 2배 넘게 부풀어, 옆에서 멈춘 사람에게
         # 0.55 m 에서 서지 않고 0.34~0.39 m 까지 파고들었다 — 그러면 밴드가 화각 아래로
@@ -1009,6 +1119,7 @@ class MjInfer(MJInferBase):
         head_yaw = np.degrees(self.data.qpos[self.model.joint("head_yaw").qposadr[0]])
         target_b = res["bearing_deg"] + head_yaw
         self.target_world_deg = body_yaw + target_b   # 안 보일 때 쓸 기억
+        self.seen_world_deg = (self.seen_world_deg + [self.target_world_deg])[-self.SEEN_HIST_N:]
         go_b, blocked = target_b, False
 
         # ── 너무 가까우면 물러난다 ────────────────────────────────────────
