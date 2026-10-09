@@ -1,4 +1,4 @@
-"""carry(머리에 물건) · skate(스케이트) · obstacle(벽·경사로) 학습 진입점.
+"""carry(머리에 물건) · skate(스케이트) · obstacle(벽·경사로) · emolo(감정 스타일 걷기) 학습 진입점.
 
 runner.py 를 고치지 않으려고 따로 둔다 (standup_runner.py 와 같은 이유 — 서버의 걷기 잡이 그 파일을 쓴다).
 
@@ -35,6 +35,12 @@ class AddonRunner(BaseRunner):
             self.env = skate.Skate(self.env_config)
             self.eval_env = skate.Skate(self.env_config)
             self.randomizer = randomize.domain_randomize
+        elif args.env == "emolo":
+            from playground.open_duck_mini_v2 import emolo
+            self.env_config = emolo.default_config()
+            self.env = emolo.Emolo(config=self.env_config)
+            self.eval_env = emolo.Emolo(config=self.env_config)
+            self.randomizer = randomize.domain_randomize
         elif args.env == "obstacle":
             from playground.open_duck_mini_v2 import obstacle
             self.env_config = obstacle.default_config()
@@ -52,7 +58,7 @@ class AddonRunner(BaseRunner):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Open Duck Mini V2 carry / skate runner")
-    parser.add_argument("--env", type=str, required=True, choices=["carry", "skate", "obstacle"])
+    parser.add_argument("--env", type=str, required=True, choices=["carry", "skate", "obstacle", "emolo"])
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--num_timesteps", type=int, default=300000000)
     parser.add_argument("--task", type=str, default="ignored",

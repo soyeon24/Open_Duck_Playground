@@ -174,6 +174,7 @@ class MjInfer(MJInferBase):
         # 춤(1~5)과 추종(F/N)은 필요할 때 자기가 켠다. T 로 직접 켤 수도 있다.
         self.direct_head = False
         self.dance = None       # None 이면 춤 안 춤. 아니면 DANCES 의 인덱스
+        self.emolo_style = None  # emolo 정책이면 0/1/2 (Neutral/Happy/Sad), 아니면 None
         self.dance_t = 0.0
 
         # ── 방위 유지 (K 키) ──────────────────────────────────────────────
@@ -587,6 +588,10 @@ class MjInfer(MJInferBase):
             self.dance_t = 0.0
             self.direct_head = True
             print(f">>> 춤: {DANCES[self.dance][0]}  (0 키로 정지)")
+            return
+        if self.emolo_style is not None and keycode in (85, 74, 77):  # U / J / M : 기쁨 / 보통 / 슬픔 (emolo)
+            self.emolo_style = {85: 1, 74: 0, 77: 2}[keycode]
+            print(f">>> 스타일: {('보통 Neutral', '기쁨 Happy', '슬픔 Sad')[self.emolo_style]}")
             return
         if keycode == 48:  # 0 : 춤 정지
             self.dance = None
@@ -1302,6 +1307,9 @@ class MjInfer(MJInferBase):
         # 물러나는 동안만 후진이 되는 정책으로 추론한다 (backoff). 나머지는 기본 정책.
         policy = (self.back_policy if self.backing and self.back_policy is not None
                   else self.policy)
+        if self.emolo_style is not None:
+            # emolo 정책은 관측 끝에 스타일 one-hot 3칸 (Neutral, Happy, Sad) 을 받는다 (emolo.py)
+            obs = np.concatenate([np.asarray(obs, np.float32), np.eye(3, dtype=np.float32)[self.emolo_style]])
         action = policy.infer(obs)
 
         # self.action_filter.push(action)
@@ -1448,6 +1456,11 @@ if __name__ == "__main__":
     parser.add_argument("--direct_head", action="store_true", default=False,
                         help="머리를 정책 대신 명령으로 직접 구동한 채 시작한다 "
                              "(T 키와 같다). 머리는 움직이지만 걸음이 왼쪽으로 휜다")
+    parser.add_argument("--emolo", action="store_true", default=False,
+                        help="감정 스타일 정책 (emolo.py). U / J / M 키로 기쁨 / 보통 / 슬픔. "
+                             "--head_pitch_scale 로 학습 때의 HEAD_PITCH_ACTION_SCALE 을 맞출 것")
+    parser.add_argument("--head_pitch_scale", type=float, default=0.5,
+                        help="--emolo 일 때 head_pitch action 폭 (emolo_hp 는 0.5)")
     parser.add_argument("--forcerange", type=float, default=None,
                         help="토크 상한[N·m]. 씬 XML 은 ±3.23 으로 고정돼 있는데 "
                              "fr186 계열은 ±1.86 으로 학습됐다. 학습값과 다르게 "
@@ -1474,6 +1487,12 @@ if __name__ == "__main__":
         )
         print(f">>> forcerange ±{args.forcerange} N·m")
     mjinfer.direct_head = args.direct_head
+    if args.emolo:
+        sc = np.full(mjinfer.model.nu, mjinfer.action_scale)
+        sc[6] = args.head_pitch_scale            # head_pitch 하나만 (joystick HEAD_PITCH_ACTION_SCALE)
+        mjinfer.action_scale = sc
+        mjinfer.emolo_style = 0
+        print(f">>> emolo: head_pitch 폭 {args.head_pitch_scale}, 스타일 보통 — U 기쁨 / J 보통 / M 슬픔")
     # 라이브러리 기본값은 꺼짐이고, **뷰어에서만** 켜고 시작한다. eval_* 은
     # MjInfer 를 직접 만들어 쓰므로 정책 맨몸을 그대로 잰다.
     mjinfer.heading_hold = not args.no_heading_hold

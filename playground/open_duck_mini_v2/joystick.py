@@ -171,8 +171,12 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         _head_as = float(os.environ.get("HEAD_ACTION_SCALE", _as))
         _scale_vec = np.full(self._mj_model.nu, _as, dtype=np.float32)
         _scale_vec[5:9] = _head_as
+        # HEAD_PITCH_ACTION_SCALE (10-09, emolo): head_pitch(인덱스 6) 하나만 따로. HEAD_ACTION_SCALE 로 머리 4축을
+        # 다 넓히면 정책이 head_yaw·roll 까지 써서 머리를 기울이고 몸이 돈다 (emolo_h5: roll 평균 0.2 rad, 20초 요 ±180°).
+        if os.environ.get("HEAD_PITCH_ACTION_SCALE"):
+            _scale_vec[6] = float(os.environ["HEAD_PITCH_ACTION_SCALE"])
         self._action_scale_vec = jp.array(_scale_vec)
-        print("[joystick] action_scale: legs %.3f / head %.3f" % (_as, _head_as))
+        print("[joystick] action_scale: legs %.3f / head %.3f / head_pitch %.3f" % (_as, _head_as, float(_scale_vec[6])))
         print("[joystick] lin_vel_x %s / lin_vel_y %s / head_pos_w %s / cmd_axis_zero %s"
               % (list(self._config.lin_vel_x), list(self._config.lin_vel_y),
                  self._config.reward_config.scales.get("head_pos"),
