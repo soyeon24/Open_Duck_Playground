@@ -100,6 +100,16 @@ REF_STATES = constants.ROOT_PATH / "data" / "standup_refstates.npy"
 # diverged on the server, so an env var is the only knob that does not mean
 # shipping a shared file.
 REF_FRACTION = float(os.environ.get("REF_FRACTION", "0.5"))
+# P_HOME (10-09, v9): 이 확률로 home(서 있는 자세)에서 시작한다. v1~v8 의 시작 분포에는 서 있는 상태가
+# 한 번도 없었다 — 자세 뱅크는 넘어진 자세, RSI 궤적은 웅크림에서 끝난다. 그래서 정책은 "서 있으면 보상이
+# 크다" 를 겪은 적이 없고, v8 은 발을 딛고 깊이 웅크린 자세(up 0.73, 몸통이 바닥에 닿음)에서 멈췄다.
+P_HOME = float(os.environ.get("P_HOME", "0.0"))
+# STANDUP_STAGE2=1 (10-09, 2단 기립의 두 번째 정책): 넘어진 자세 대신 웅크림 자세(standup_crouch.npy — v8/v9 가 넘어진
+# 자세에서 실제로 도달한 상태 158개)에서 시작하고(RSI 는 안 씀, P_HOME 은 그대로 먹는다), **넘어지면 끝낸다**
+# (up < STAGE2_FALL_UP). v9 는 서서 시작해도 넘어지는 데 손해가 적어(넘어진 뒤 웅크림 보상이 다시 나옴) 서 있기를 안 지켰다.
+STAGE2 = os.environ.get("STANDUP_STAGE2", "0") == "1"
+STAGE2_FALL_UP = float(os.environ.get("STAGE2_FALL_UP", "0.3"))
+CROUCH_BANK = constants.ROOT_PATH / "data" / "standup_crouch.npy"
 
 # The height that counts as "fully stood up"; the home keyframe puts the base
 # at 0.15 m.
@@ -200,6 +210,46 @@ class Standup(Joystick):
         )
         self._post_init()
 
+        # STANDUP_ACTION: how far an action can move a joint target away from home.
+        #   unset / a number -> that action_scale on the legs (default 0.25, same as walking)
+        #   "full"           -> per joint, enough to reach either end of the joint range
+        #                       (ctrl is clamped to the range by the actuator, inheritrange=1)
+        # Why (2026-10-09): with 0.25 rad the known get-up cannot be expressed at all. The CEM
+        # trajectory (standup_ref_traj.npz) swings the knee +1.37 -> -1.49 rad and the ankle
+        # 93 deg; clamping the same search to home +-0.25 / 0.5 / 1.0 / 1.5 rad scores
+        # 0.001 / 0.045 / 0.173 / 0.194 against 0.873 over the full range. v1-v6 never could.
+        mode = os.environ.get("STANDUP_ACTION", "")
+        # "delta": action 이 직전 목표에서의 이동량 (±1 = 서보 한 스텝 최대 0.105 rad). full 로 폭을 다 주면
+        # 학습 중 탐색 잡음도 무릎 ±2.9 rad 이 돼서 서서 버티기를 연습할 수가 없다 — v7 은 거의 선 자세(up 0.91)
+        # 에서 시작해도 스스로 눕는다. delta 면 잡음은 스텝당 ±6° 안이고, 시간을 들이면 어느 자세든 간다.
+        self._delta_action = mode == "delta"
+        # STANDUP_LEAK (v10, 10-09): delta 목표를 스텝마다 이만큼 home 쪽으로 되돌린다. delta 만 쓰면 학습 중 탐색
+        # 잡음이 스텝마다 쌓여 목표가 랜덤워크로 흘러간다 — 서 있기(action 0)를 연습할 수가 없어서 v9 는 40% 를 서서
+        # 시작해도 0.5초 안에 스스로 넘어졌다 (가만히 두면 home 에서 10초 서 있는데). 누수가 있으면 잡음 효과가 유계이고
+        # action 0 이 곧 "서 있는 자세로 돌아가 머물기" 다. 버틸 수 있는 최대 이탈 = 0.105 / leak (0.03 이면 3.5 rad).
+        self._delta_leak = float(os.environ.get("STANDUP_LEAK", "0.0"))
+        jid = [self._mj_model.actuator_trnid[a][0] for a in range(self._mj_model.nu)]
+        self._ctrl_lo = jp.array([self._mj_model.jnt_range[j][0] for j in jid])
+        self._ctrl_hi = jp.array([self._mj_model.jnt_range[j][1] for j in jid])
+        if self._delta_action:
+            print(f"[standup] STANDUP_ACTION=delta: 스텝당 최대 "
+                  f"{self._config.max_motor_velocity * self.dt:.3f} rad, 목표는 관절 범위로 자름")
+        elif mode:
+            scale = np.array(self._action_scale_vec, dtype=np.float32)
+            if mode == "full":
+                jid = [self._mj_model.actuator_trnid[a][0] for a in range(self._mj_model.nu)]
+                lo = np.array([self._mj_model.jnt_range[j][0] for j in jid])
+                hi = np.array([self._mj_model.jnt_range[j][1] for j in jid])
+                home = np.asarray(self._default_actuator)
+                legs = np.maximum(home - lo, hi - home).astype(np.float32)
+            else:
+                legs = np.full(self._mj_model.nu, float(mode), dtype=np.float32)
+            idx = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]   # legs; head (5:9) keeps its scale
+            scale[idx] = legs[idx]
+            self._action_scale_vec = jp.array(scale)
+            print(f"[standup] STANDUP_ACTION={mode}: leg action_scale "
+                  f"{np.round(scale[idx[:5]], 2).tolist()} (left)")
+
         self._body_geom_id = np.array(
             [self._mj_model.geom(name).id for name in BODY_GEOMS]
         )
@@ -216,6 +266,12 @@ class Standup(Joystick):
                 f"has nq={self.mjx_model.nq}. Regenerate the bank against the same XML."
             )
         self._fallen_qpos = jp.asarray(fallen)
+        if STAGE2:
+            crouch = np.load(CROUCH_BANK.as_posix())
+            assert crouch.shape[1] == self.mjx_model.nq, crouch.shape
+            self._fallen_qpos = jp.asarray(crouch)   # 같은 자리에서 뽑게 바꿔 끼운다
+            print(f"[standup] STAGE2: 웅크림 {crouch.shape[0]}개에서 시작, up < {STAGE2_FALL_UP} 이면 종료,"
+                  f" P_HOME {P_HOME}")
 
         if not REF_STATES.exists():
             raise FileNotFoundError(
@@ -278,7 +334,7 @@ class Standup(Joystick):
         # fallen pose.
         state = super().reset(rng)
         info = dict(state.info)
-        rng, k_pose, k_joint, k_ref, k_mode = jax.random.split(info["rng"], 5)
+        rng, k_pose, k_joint, k_ref, k_mode, k_home = jax.random.split(info["rng"], 6)
 
         fallen = self._fallen_qpos[
             jax.random.randint(k_pose, (), 0, self._fallen_qpos.shape[0])
@@ -286,7 +342,7 @@ class Standup(Joystick):
         # The other half of the draw: a state part-way along a get-up that
         # works. See REF_FRACTION for why this is here rather than a reward.
         i_ref = jax.random.randint(k_ref, (), 0, self._ref_qpos.shape[0])
-        use_ref = jax.random.uniform(k_mode, ()) < REF_FRACTION
+        use_ref = (jax.random.uniform(k_mode, ()) < REF_FRACTION) & (not STAGE2)
 
         qpos = jp.where(use_ref, self._ref_qpos[i_ref], fallen)
         # Reference states carry momentum, and dropping it would start the
@@ -294,6 +350,9 @@ class Standup(Joystick):
         # mid-roll with zero angular velocity is a different problem. Poses from
         # the bank have already come to rest, so zero is right for those.
         qvel = jp.where(use_ref, self._ref_qvel[i_ref], jp.zeros(self.mjx_model.nv))
+        use_home = jax.random.uniform(k_home, ()) < P_HOME
+        qpos = jp.where(use_home, self._init_q, qpos)
+        qvel = jp.where(use_home, jp.zeros(self.mjx_model.nv), qvel)
 
         # A little joint jitter on top, so the policy cannot memorise the table
         # entries. Kept small: the bank poses are resting in contact, and a large
@@ -307,6 +366,9 @@ class Standup(Joystick):
         data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=ctrl)
 
         info["rng"] = rng
+        # 서보 목표를 지금 자세에서 시작한다. Joystick.reset 은 home(서 있는 자세)으로 두는데, 그러면 넘어진
+        # 자세에서 첫 스텝부터 서보가 home 쪽으로 끌려간다 (v1~v7 모두 그랬다, 10-09 발견).
+        info["motor_targets"] = jp.clip(ctrl, self._ctrl_lo, self._ctrl_hi)
         contact = jp.array(
             [
                 geoms_colliding(data, geom_id, self._floor_geom_id)
@@ -324,7 +386,10 @@ class Standup(Joystick):
         # Joystick ends the episode as soon as the torso passes horizontal.
         # Keeping that here would make the task unlearnable: the robot would be
         # reset before it ever got a chance to push itself back up.
-        return jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
+        bad = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
+        if STAGE2:
+            return bad | (self.get_gravity(data)[-1] < STAGE2_FALL_UP)
+        return bad
 
     # -- rewards ---------------------------------------------------------------
 

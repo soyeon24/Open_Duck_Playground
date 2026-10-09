@@ -175,7 +175,7 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         print("[joystick] action_scale: legs %.3f / head %.3f" % (_as, _head_as))
         print("[joystick] lin_vel_x %s / lin_vel_y %s / head_pos_w %s / cmd_axis_zero %s"
               % (list(self._config.lin_vel_x), list(self._config.lin_vel_y),
-                 self._config.reward_config.scales.head_pos,
+                 self._config.reward_config.scales.get("head_pos"),
                  self._config.cmd_axis_zero))
 
         if USE_IMITATION_REWARD:
@@ -458,7 +458,19 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             self._default_actuator + action_w_delay * self._action_scale_vec
         )
 
-        if USE_MOTOR_SPEED_LIMITS:
+        if getattr(self, "_delta_action", False):
+            # 기립 전용 (standup.py STANDUP_ACTION=delta, 10-09). action 은 "직전 목표에서 이번 스텝에
+            # 얼마나 옮기나" 이고 ±1 이 서보 한 스텝 최대 이동(max_motor_velocity * dt). 걷기 잡은 이 속성이
+            # 없어서 아래 원래 경로를 탄다.
+            prev = state.info["motor_targets"]
+            motor_targets = jp.clip(
+                prev
+                + action_w_delay * self._config.max_motor_velocity * self.dt
+                - self._delta_leak * (prev - self._default_actuator),
+                self._ctrl_lo,
+                self._ctrl_hi,
+            )
+        elif USE_MOTOR_SPEED_LIMITS:
             prev_motor_targets = state.info["motor_targets"]
 
             motor_targets = jp.clip(
