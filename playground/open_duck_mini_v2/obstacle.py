@@ -56,6 +56,12 @@ def default_config():
     # 경사를 실제로 밟는 판이 적었다 (경사 10° 이상 0/16 그대로, 학습 보상도 안 떨어짐).
     cfg.obst_hold = e("OBST_HOLD", "0") == "1"
     cfg.obst_vx_lo = float(e("OBST_VX_LO", "0.08"))
+    # PLACE_P (10-10): 이 확률로 "손에 들렸다 내려놓인" 시작 — 장애물 없음, 몸통을 0~PLACE_MAX 도 아무 방향으로 기울이고
+    # 0~PLACE_DZ m 띄워서 정지 상태로 놓는다, 명령은 멈춤 (10초 뒤 다시 뽑을 때까지). 걷기 학습은 늘 발을 딛고 선 채로
+    # 시작해서, 20° 기울여 놓으면 1~5/8, 30° 면 0/8 만 버텼다 (scratch place_test.py).
+    cfg.place_p = float(e("PLACE_P", "0.0"))
+    cfg.place_max = math.radians(float(e("PLACE_MAX", "25")))
+    cfg.place_dz = float(e("PLACE_DZ", "0.05"))
     return cfg
 
 
@@ -91,7 +97,8 @@ class Obstacle(joystick.Joystick):
         c = config
         print(f"[obstacle] p_wall {c.obst_p_wall} / p_ramp {c.obst_p_ramp} / dist {list(c.obst_dist)}"
               f" / wall_ang {math.degrees(c.obst_wall_ang):.0f} deg"
-              f" / slope {[round(math.degrees(s), 1) for s in c.obst_slope]} deg")
+              f" / slope {[round(math.degrees(s), 1) for s in c.obst_slope]} deg"
+              f" / place p {c.place_p} max {math.degrees(c.place_max):.0f} deg dz {c.place_dz}")
 
     # ── 발 접지: 바닥 또는 경사로 ──────────────────────────────────────────
     def _contact(self, data: mjx.Data) -> jax.Array:
@@ -110,18 +117,20 @@ class Obstacle(joystick.Joystick):
     def reset(self, rng: jax.Array) -> mjx_env.State:
         state = super().reset(rng)
         info = dict(state.info)
-        rng, k_kind, k_d, k_b, k_s, k_v = jax.random.split(info["rng"], 6)
+        rng, k_kind, k_d, k_b, k_s, k_v, k_pl, k_pa, k_pd, k_pz = jax.random.split(info["rng"], 10)
         info["rng"] = rng
         c = self._config
         d = state.data
 
         u = jax.random.uniform(k_kind, ())
-        is_wall = u < c.obst_p_wall
-        is_ramp = (u >= c.obst_p_wall) & (u < c.obst_p_wall + c.obst_p_ramp)
+        is_place = jax.random.uniform(k_pl, ()) < c.place_p
+        is_wall = (u < c.obst_p_wall) & ~is_place
+        is_ramp = (u >= c.obst_p_wall) & (u < c.obst_p_wall + c.obst_p_ramp) & ~is_place
         hold = (is_wall | is_ramp) & c.obst_hold
         vx = jax.random.uniform(k_v, (), minval=c.obst_vx_lo, maxval=c.lin_vel_x[1])
         cmd = jp.where(hold, info["command"].at[0].set(vx).at[1].set(0.0).at[2].set(0.0),
                        info["command"])
+        cmd = jp.where(is_place, info["command"].at[0:3].set(0.0), cmd)
         info["command"] = cmd
         info["obst_hold"] = hold
         info["obst_cmd"] = cmd
@@ -151,20 +160,30 @@ class Obstacle(joystick.Joystick):
 
         mp = d.mocap_pos.at[self._wall_mocap].set(wall_pos).at[self._ramp_mocap].set(ramp_pos)
         mq = d.mocap_quat.at[self._wall_mocap].set(wall_quat).at[self._ramp_mocap].set(ramp_quat)
-        data = d.replace(mocap_pos=mp, mocap_quat=mq)
+        # 내려놓기: 수평축 하나를 골라 몸통을 기울이고(월드 기준), 기운 만큼 더 띄워 발이 바닥에 박히지 않게 한다
+        ang = jax.random.uniform(k_pa, (), minval=0.0, maxval=c.place_max)
+        az = jax.random.uniform(k_pd, (), minval=-jp.pi, maxval=jp.pi)
+        h = ang / 2
+        q_tilt = jp.array([jp.cos(h), jp.cos(az) * jp.sin(h), jp.sin(az) * jp.sin(h), 0.0])
+        dz = jax.random.uniform(k_pz, (), minval=0.0, maxval=c.place_dz) + 0.03 * jp.sin(ang)
+        qpos = d.qpos
+        qpos = jp.where(is_place, qpos.at[2].add(dz).at[3:7].set(_qmul(q_tilt, qpos[3:7])), qpos)
+        qvel = jp.where(is_place, jp.zeros_like(d.qvel), d.qvel)
+        data = d.replace(mocap_pos=mp, mocap_quat=mq, qpos=qpos, qvel=qvel)
         data = mjx.forward(self.mjx_model, data)
         metrics = dict(state.metrics)
         metrics["obst_wall"] = is_wall.astype(jp.float32)
         metrics["obst_ramp"] = is_ramp.astype(jp.float32)
+        metrics["obst_place"] = is_place.astype(jp.float32)
         obs = self._get_obs(data, info, self._contact(data))
         return state.replace(data=data, obs=obs, info=info, metrics=metrics)
 
     def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
         # metrics 의 키는 reset 과 step 이 같아야 한다 (brax 가 트리 구조를 맞춘다).
-        ow, orp = state.metrics["obst_wall"], state.metrics["obst_ramp"]
+        ow, orp, opl = state.metrics["obst_wall"], state.metrics["obst_ramp"], state.metrics["obst_place"]
         state = super().step(state, action)
         metrics = dict(state.metrics)
-        metrics["obst_wall"], metrics["obst_ramp"] = ow, orp
+        metrics["obst_wall"], metrics["obst_ramp"], metrics["obst_place"] = ow, orp, opl
         # joystick.step 이 명령을 다시 뽑았어도 벽·경사 판이면 처음 명령으로 되돌린다
         # (다시 뽑는 건 관측을 만든 뒤라, 되돌린 값이 다음 스텝 관측에 그대로 들어간다).
         info = dict(state.info)
